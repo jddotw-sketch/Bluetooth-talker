@@ -1,7 +1,10 @@
 package com.example.audio
 
 import android.annotation.SuppressLint
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
@@ -12,6 +15,8 @@ import android.media.MediaRecorder
 import android.media.projection.MediaProjection
 import android.os.Build
 import android.util.Log
+import com.example.model.AudioQuality
+import com.example.model.AudioRoute
 import com.example.model.AudioSourceMode
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -28,22 +33,27 @@ import kotlin.math.sqrt
 class AudioStreamManager(
     private val context: Context,
     private val onAudioPacketReady: (ByteArray) -> Unit,
-    private val onAmplitudeChanged: (isTransmitting: Boolean, amplitude: Float) -> Unit
+    private val onAmplitudeChanged: (isTransmitting: Boolean, amplitude: Float) -> Unit,
+    private val onHeadsetStateChanged: (isPlugged: Boolean) -> Unit = {}
 ) {
     companion object {
-        const val SAMPLE_RATE = 16000
-        const val CHUNK_SIZE = 640 // 320 16-bit samples = 20ms of audio
         private const val TAG = "AudioStreamManager"
     }
 
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     private val scope = CoroutineScope(Dispatchers.IO)
 
+    var currentQuality: AudioQuality = AudioQuality.HI_FI_44K
+        private set
+
+    var currentRoute: AudioRoute = AudioRoute.HEADSET_OR_AUTO
+        private set
+
     private var audioRecord: AudioRecord? = null
     private var audioTrack: AudioTrack? = null
 
-    // Single-threaded playback queue (CRITICAL: prevents concurrent AudioTrack.write SIGSEGV crashes)
-    private val playbackQueue = LinkedBlockingQueue<ByteArray>(80)
+    // Generous playback queue (300 chunks) to completely prevent audio dropping during small BT jitter
+    private val playbackQueue = LinkedBlockingQueue<ByteArray>(300)
     private var playbackJob: Job? = null
 
     private var recordingJob: Job? = null
@@ -62,28 +72,100 @@ class AudioStreamManager(
     private var lastTxAmplitudeTime = 0L
     private var lastRxAmplitudeTime = 0L
 
+    private var isHeadsetReceiverRegistered = false
+    private val headsetReceiver = object : BroadcastReceiver() {
+        override fun onReceive(ctx: Context?, intent: Intent?) {
+            if (intent?.action == Intent.ACTION_HEADSET_PLUG) {
+                val state = intent.getIntExtra("state", -1)
+                val isPlugged = state == 1
+                Log.d(TAG, "Headset plug event: isPlugged=$isPlugged")
+                if (isPlugged && currentRoute == AudioRoute.HEADSET_OR_AUTO) {
+                    setAudioOutputRoute(AudioRoute.HEADSET_OR_AUTO)
+                }
+                onHeadsetStateChanged(isPlugged)
+            }
+        }
+    }
+
     init {
-        initAudioTrack()
+        registerHeadsetReceiver()
+        setAudioOutputRoute(AudioRoute.HEADSET_OR_AUTO)
+        initAudioTrack(currentQuality.sampleRate)
         startPlaybackWorker()
     }
 
-    private fun initAudioTrack() {
+    private fun registerHeadsetReceiver() {
+        if (!isHeadsetReceiverRegistered) {
+            val filter = IntentFilter(Intent.ACTION_HEADSET_PLUG)
+            context.registerReceiver(headsetReceiver, filter)
+            isHeadsetReceiverRegistered = true
+        }
+    }
+
+    fun setAudioQuality(quality: AudioQuality) {
+        if (currentQuality == quality) return
+        currentQuality = quality
+        initAudioTrack(quality.sampleRate)
+    }
+
+    fun setRemoteSampleRate(sampleRate: Int) {
+        val targetQuality = if (sampleRate >= 32000) AudioQuality.HI_FI_44K else AudioQuality.STANDARD_16K
+        if (currentQuality.sampleRate != sampleRate) {
+            Log.d(TAG, "Adapting AudioTrack to remote sample rate: $sampleRate Hz")
+            currentQuality = targetQuality
+            initAudioTrack(sampleRate)
+        }
+    }
+
+    fun setAudioOutputRoute(route: AudioRoute) {
+        currentRoute = route
         try {
+            when (route) {
+                AudioRoute.HEADSET_OR_AUTO -> {
+                    // MODE_NORMAL is optimal for 3.5mm jack headsets, USB-C headphones & high-fidelity media
+                    audioManager.mode = AudioManager.MODE_NORMAL
+                    audioManager.isSpeakerphoneOn = false
+                }
+                AudioRoute.SPEAKERPHONE -> {
+                    audioManager.mode = AudioManager.MODE_NORMAL
+                    audioManager.isSpeakerphoneOn = true
+                }
+                AudioRoute.EARPIECE -> {
+                    audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+                    audioManager.isSpeakerphoneOn = false
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error configuring audio route: ${e.message}")
+        }
+    }
+
+    @Synchronized
+    private fun initAudioTrack(sampleRate: Int) {
+        try {
+            audioTrack?.let { oldTrack ->
+                try {
+                    oldTrack.stop()
+                    oldTrack.release()
+                } catch (ignored: Exception) {}
+            }
+
             val minBufSize = AudioTrack.getMinBufferSize(
-                SAMPLE_RATE,
+                sampleRate,
                 AudioFormat.CHANNEL_OUT_MONO,
                 AudioFormat.ENCODING_PCM_16BIT
             )
-            val bufferSize = maxOf(minBufSize * 2, 4096)
+            // Generous Jitter Buffer (~500ms) to ensure continuous playback without cutting out
+            val bufferSize = maxOf(minBufSize * 4, 16384)
 
             val audioAttributes = AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_MEDIA)
-                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
                 .build()
 
             val audioFormat = AudioFormat.Builder()
                 .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                .setSampleRate(SAMPLE_RATE)
+                .setSampleRate(sampleRate)
                 .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                 .build()
 
@@ -97,7 +179,7 @@ class AudioStreamManager(
             if (audioTrack?.state == AudioTrack.STATE_INITIALIZED) {
                 audioTrack?.play()
             } else {
-                Log.e(TAG, "AudioTrack failed to initialize")
+                Log.e(TAG, "AudioTrack failed to initialize at $sampleRate Hz")
             }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to init AudioTrack: ${e.message}")
@@ -111,7 +193,7 @@ class AudioStreamManager(
                 try {
                     val data = playbackQueue.take()
                     if (audioTrack == null || audioTrack?.state != AudioTrack.STATE_INITIALIZED) {
-                        initAudioTrack()
+                        initAudioTrack(currentQuality.sampleRate)
                     }
                     audioTrack?.let { track ->
                         if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
@@ -132,31 +214,22 @@ class AudioStreamManager(
         }
     }
 
-    fun setSpeakerphone(enabled: Boolean) {
-        try {
-            audioManager.isSpeakerphoneOn = enabled
-            if (enabled) {
-                audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-            } else {
-                audioManager.mode = AudioManager.MODE_NORMAL
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error setting speakerphone: ${e.message}")
-        }
-    }
-
     @SuppressLint("MissingPermission")
     fun startRecording(sourceMode: AudioSourceMode = AudioSourceMode.MICROPHONE, loopbackMode: Boolean = false) {
         if (isRecording) return
         isLoopback = loopbackMode
 
         try {
+            val sampleRate = currentQuality.sampleRate
+            // ~20ms chunk size
+            val chunkSize = (sampleRate * 2 * 20) / 1000 // 20ms of 16-bit PCM
+
             val minBufSize = AudioRecord.getMinBufferSize(
-                SAMPLE_RATE,
+                sampleRate,
                 AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT
             )
-            val bufferSize = maxOf(minBufSize * 2, CHUNK_SIZE * 4)
+            val bufferSize = maxOf(minBufSize * 4, chunkSize * 6)
 
             // AUDIO RELAY (Capture internal device & app audio on Android 10+)
             if (sourceMode == AudioSourceMode.APP_AUDIO_RELAY && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && mediaProjection != null) {
@@ -169,7 +242,7 @@ class AudioStreamManager(
 
                     val audioFormat = AudioFormat.Builder()
                         .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                        .setSampleRate(SAMPLE_RATE)
+                        .setSampleRate(sampleRate)
                         .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
                         .build()
 
@@ -194,7 +267,7 @@ class AudioStreamManager(
 
                 audioRecord = AudioRecord(
                     source,
-                    SAMPLE_RATE,
+                    sampleRate,
                     AudioFormat.CHANNEL_IN_MONO,
                     AudioFormat.ENCODING_PCM_16BIT,
                     bufferSize
@@ -204,7 +277,7 @@ class AudioStreamManager(
                     audioRecord?.release()
                     audioRecord = AudioRecord(
                         MediaRecorder.AudioSource.MIC,
-                        SAMPLE_RATE,
+                        sampleRate,
                         AudioFormat.CHANNEL_IN_MONO,
                         AudioFormat.ENCODING_PCM_16BIT,
                         bufferSize
@@ -221,7 +294,7 @@ class AudioStreamManager(
             isRecording = true
 
             recordingJob = scope.launch {
-                val buffer = ByteArray(CHUNK_SIZE)
+                val buffer = ByteArray(chunkSize)
                 while (isActive && isRecording) {
                     val readBytes = audioRecord?.read(buffer, 0, buffer.size) ?: -1
                     if (readBytes > 0) {
@@ -261,9 +334,9 @@ class AudioStreamManager(
 
     fun playIncomingAudio(data: ByteArray) {
         if (data.isEmpty()) return
-        // Offer to single-threaded playback queue
-        if (playbackQueue.remainingCapacity() < 5) {
-            playbackQueue.poll() // Discard oldest packet if lagging to keep realtime
+        // Keep smooth playback buffer: only discard if buffer is completely saturated (>290)
+        if (playbackQueue.remainingCapacity() < 2) {
+            playbackQueue.poll()
         }
         playbackQueue.offer(data)
 
@@ -349,10 +422,11 @@ class AudioStreamManager(
     }
 
     private fun generateTone(frequencyHz: Double, durationMs: Int, volume: Float): ByteArray {
-        val numSamples = (SAMPLE_RATE * durationMs) / 1000
+        val sampleRate = currentQuality.sampleRate
+        val numSamples = (sampleRate * durationMs) / 1000
         val shortArray = ShortArray(numSamples)
         for (i in 0 until numSamples) {
-            val angle = 2.0 * PI * i * frequencyHz / SAMPLE_RATE
+            val angle = 2.0 * PI * i * frequencyHz / sampleRate
             val envelope = when {
                 i < numSamples * 0.1 -> i / (numSamples * 0.1)
                 i > numSamples * 0.9 -> (numSamples - i) / (numSamples * 0.1)
@@ -372,6 +446,12 @@ class AudioStreamManager(
         stopRecording()
         playbackJob?.cancel()
         playbackQueue.clear()
+        if (isHeadsetReceiverRegistered) {
+            try {
+                context.unregisterReceiver(headsetReceiver)
+            } catch (ignored: Exception) {}
+            isHeadsetReceiverRegistered = false
+        }
         try {
             audioTrack?.stop()
             audioTrack?.release()

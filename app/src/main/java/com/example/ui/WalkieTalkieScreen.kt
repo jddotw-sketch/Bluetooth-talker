@@ -43,6 +43,7 @@ import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.Radio
 import androidx.compose.material.icons.filled.Sensors
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SettingsVoice
 import androidx.compose.material.icons.filled.VolumeDown
 import androidx.compose.material.icons.filled.VolumeUp
@@ -75,9 +76,13 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.model.AudioQuality
+import com.example.model.AudioRoute
 import com.example.model.AudioSourceMode
+import com.example.model.BluetoothDeviceInfo
 import com.example.model.ConnectionState
 import com.example.model.WalkieMode
+import com.example.ui.components.AudioSettingsSheet
 import com.example.ui.components.DeviceSelectionSheet
 import com.example.ui.components.PttButton
 import com.example.ui.components.QuickMessageSheet
@@ -201,7 +206,8 @@ fun WalkieTalkieScreen(
                     connectionState = uiState.connectionState,
                     chatCount = uiState.chatMessages.size,
                     onOpenDevices = { viewModel.setDeviceDialogVisible(true) },
-                    onOpenChat = { viewModel.setQuickMessageSheetVisible(true) }
+                    onOpenChat = { viewModel.setQuickMessageSheetVisible(true) },
+                    onOpenSettings = { viewModel.setAudioSettingsDialogVisible(true) }
                 )
 
                 Spacer(modifier = Modifier.height(10.dp))
@@ -253,11 +259,15 @@ fun WalkieTalkieScreen(
 
                 Spacer(modifier = Modifier.height(8.dp))
 
-                // Tactical Radio Display HUD
+                // Tactical Radio Display HUD (With Hi-Fi badge, Audio Jack Headset state & Auto-connect tag)
                 RadioHudCard(
                     connectionState = uiState.connectionState,
                     walkieMode = uiState.walkieMode,
                     audioSourceMode = uiState.audioSourceMode,
+                    audioQuality = uiState.audioQuality,
+                    audioRoute = uiState.audioRoute,
+                    isHeadsetPlugged = uiState.isHeadsetPlugged,
+                    autoConnectEnabled = uiState.autoConnectEnabled,
                     isTransmitting = uiState.isTransmitting,
                     isReceiving = uiState.isReceivingAudio,
                     isLoopbackActive = uiState.isLoopbackTestActive,
@@ -303,14 +313,22 @@ fun WalkieTalkieScreen(
                     Spacer(modifier = Modifier.height(14.dp))
                 }
 
-                // Tactical Control Toolbar
+                // Tactical Control Toolbar (Headset/Speakerphone, Mute, Roger, Mic Test, Gain)
                 ControlsToolbar(
-                    isSpeakerphone = uiState.isSpeakerphone,
+                    currentRoute = uiState.audioRoute,
+                    isHeadsetPlugged = uiState.isHeadsetPlugged,
                     isMuted = uiState.isMuted,
                     isRogerBeep = uiState.rogerBeepEnabled,
                     isLoopback = uiState.isLoopbackTestActive,
                     micGain = uiState.micGain,
-                    onToggleSpeaker = { viewModel.toggleSpeakerphone() },
+                    onCycleRoute = {
+                        val nextRoute = when (uiState.audioRoute) {
+                            AudioRoute.HEADSET_OR_AUTO -> AudioRoute.SPEAKERPHONE
+                            AudioRoute.SPEAKERPHONE -> AudioRoute.EARPIECE
+                            AudioRoute.EARPIECE -> AudioRoute.HEADSET_OR_AUTO
+                        }
+                        viewModel.setAudioRoute(nextRoute)
+                    },
                     onToggleMute = { viewModel.toggleMute() },
                     onToggleRoger = { viewModel.toggleRogerBeep() },
                     onToggleLoopback = { viewModel.toggleLoopbackTest() },
@@ -322,6 +340,8 @@ fun WalkieTalkieScreen(
                 // Peer Connection Quick Action Footer
                 ConnectionFooterCard(
                     connectionState = uiState.connectionState,
+                    autoConnectEnabled = uiState.autoConnectEnabled,
+                    lastTargetName = uiState.lastConnectedDeviceName,
                     onOpenDevices = { viewModel.setDeviceDialogVisible(true) },
                     onStartListening = { viewModel.startListening() },
                     onDisconnect = { viewModel.disconnect() }
@@ -365,6 +385,28 @@ fun WalkieTalkieScreen(
                     onDismiss = { viewModel.setQuickMessageSheetVisible(false) }
                 )
             }
+
+            if (uiState.showAudioSettingsDialog) {
+                AudioSettingsSheet(
+                    audioQuality = uiState.audioQuality,
+                    audioRoute = uiState.audioRoute,
+                    isHeadsetPlugged = uiState.isHeadsetPlugged,
+                    autoConnectEnabled = uiState.autoConnectEnabled,
+                    lastConnectedName = uiState.lastConnectedDeviceName,
+                    lastConnectedAddr = uiState.lastConnectedDeviceAddress,
+                    onSetQuality = { viewModel.setAudioQuality(it) },
+                    onSetRoute = { viewModel.setAudioRoute(it) },
+                    onToggleAutoConnect = { viewModel.toggleAutoConnect() },
+                    onConnectLastDevice = {
+                        val addr = uiState.lastConnectedDeviceAddress
+                        val name = uiState.lastConnectedDeviceName
+                        if (addr != null) {
+                            viewModel.connectToDevice(BluetoothDeviceInfo(name ?: addr, addr))
+                        }
+                    },
+                    onDismiss = { viewModel.setAudioSettingsDialogVisible(false) }
+                )
+            }
         }
     }
 }
@@ -387,6 +429,32 @@ fun AudioSourceSelectorBar(
                 .padding(4.dp),
             horizontalArrangement = Arrangement.SpaceEvenly
         ) {
+            FilledTonalButton(
+                onClick = { onSelectSource(AudioSourceMode.APP_AUDIO_RELAY) },
+                colors = ButtonDefaults.filledTonalButtonColors(
+                    containerColor = if (currentSource == AudioSourceMode.APP_AUDIO_RELAY) Color(0xFF651FFF) else Color.Transparent
+                ),
+                shape = RoundedCornerShape(20.dp),
+                modifier = Modifier
+                    .weight(1f)
+                    .height(38.dp)
+                    .testTag("source_relay_button")
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Headphones,
+                    contentDescription = null,
+                    tint = if (currentSource == AudioSourceMode.APP_AUDIO_RELAY) Color.White else TextSecondary,
+                    modifier = Modifier.size(16.dp)
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    text = "Audio Relay (Music & Apps)",
+                    color = if (currentSource == AudioSourceMode.APP_AUDIO_RELAY) Color.White else TextSecondary,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+
             FilledTonalButton(
                 onClick = { onSelectSource(AudioSourceMode.MICROPHONE) },
                 colors = ButtonDefaults.filledTonalButtonColors(
@@ -412,32 +480,6 @@ fun AudioSourceSelectorBar(
                     fontWeight = FontWeight.Bold
                 )
             }
-
-            FilledTonalButton(
-                onClick = { onSelectSource(AudioSourceMode.APP_AUDIO_RELAY) },
-                colors = ButtonDefaults.filledTonalButtonColors(
-                    containerColor = if (currentSource == AudioSourceMode.APP_AUDIO_RELAY) Color(0xFF651FFF) else Color.Transparent
-                ),
-                shape = RoundedCornerShape(20.dp),
-                modifier = Modifier
-                    .weight(1f)
-                    .height(38.dp)
-                    .testTag("source_relay_button")
-            ) {
-                Icon(
-                    imageVector = Icons.Default.Headphones,
-                    contentDescription = null,
-                    tint = if (currentSource == AudioSourceMode.APP_AUDIO_RELAY) Color.White else TextSecondary,
-                    modifier = Modifier.size(16.dp)
-                )
-                Spacer(modifier = Modifier.width(6.dp))
-                Text(
-                    text = "Audio Relay (All Apps)",
-                    color = if (currentSource == AudioSourceMode.APP_AUDIO_RELAY) Color.White else TextSecondary,
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.Bold
-                )
-            }
         }
     }
 }
@@ -448,6 +490,7 @@ fun TopBarSection(
     chatCount: Int,
     onOpenDevices: () -> Unit,
     onOpenChat: () -> Unit,
+    onOpenSettings: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     Row(
@@ -480,7 +523,7 @@ fun TopBarSection(
                     letterSpacing = 0.5.sp
                 )
                 Text(
-                    text = "Walkie-Talkie & Audio Relay",
+                    text = "Hi-Fi Relay & Walkie-Talkie",
                     color = TextSecondary,
                     fontSize = 11.sp
                 )
@@ -488,11 +531,30 @@ fun TopBarSection(
         }
 
         Row(verticalAlignment = Alignment.CenterVertically) {
+            // Audio Settings button
+            IconButton(
+                onClick = onOpenSettings,
+                modifier = Modifier
+                    .size(38.dp)
+                    .clip(CircleShape)
+                    .background(SlateCard)
+                    .testTag("open_settings_button")
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Settings,
+                    contentDescription = "Audio & Connection Settings",
+                    tint = CyanNeon,
+                    modifier = Modifier.size(20.dp)
+                )
+            }
+
+            Spacer(modifier = Modifier.width(6.dp))
+
             // Chat button
             IconButton(
                 onClick = onOpenChat,
                 modifier = Modifier
-                    .size(40.dp)
+                    .size(38.dp)
                     .clip(CircleShape)
                     .background(SlateCard)
                     .testTag("open_chat_button")
@@ -515,7 +577,7 @@ fun TopBarSection(
                 }
             }
 
-            Spacer(modifier = Modifier.width(8.dp))
+            Spacer(modifier = Modifier.width(6.dp))
 
             // Devices button
             Button(
@@ -573,6 +635,10 @@ fun RadioHudCard(
     connectionState: ConnectionState,
     walkieMode: WalkieMode,
     audioSourceMode: AudioSourceMode,
+    audioQuality: AudioQuality,
+    audioRoute: AudioRoute,
+    isHeadsetPlugged: Boolean,
+    autoConnectEnabled: Boolean,
     isTransmitting: Boolean,
     isReceiving: Boolean,
     isLoopbackActive: Boolean,
@@ -626,36 +692,20 @@ fun RadioHudCard(
                     )
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
-                        text = if (audioSourceMode == AudioSourceMode.APP_AUDIO_RELAY) "AUDIO RELAY • SYSTEM MEDIA" else "CH-01 • 16 kHz HD VOICE",
-                        color = TextSecondary,
+                        text = if (audioQuality == AudioQuality.HI_FI_44K) "HI-FI 44.1 kHz • LDAC QUALITY" else "16 kHz VOICE",
+                        color = if (audioQuality == AudioQuality.HI_FI_44K) CyanNeon else TextSecondary,
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Bold,
-                        letterSpacing = 1.sp
+                        letterSpacing = 0.8.sp
                     )
                 }
 
-                // Status tag
+                // Output Route or Headset state tag
                 Text(
-                    text = when {
-                        isTransmitting && audioSourceMode == AudioSourceMode.APP_AUDIO_RELAY -> "RELAYING AUDIO"
-                        isTransmitting -> "TRANSMITTING"
-                        isReceiving -> "RECEIVING"
-                        isLoopbackActive -> "MIC TEST ACTIVE"
-                        connectionState is ConnectionState.Connected -> "LINK ACTIVE"
-                        connectionState is ConnectionState.Listening -> "LISTENING"
-                        else -> "STANDBY"
-                    },
-                    color = when {
-                        isTransmitting && audioSourceMode == AudioSourceMode.APP_AUDIO_RELAY -> CyanNeon
-                        isTransmitting -> AmberTransmitting
-                        isReceiving -> GreenConnected
-                        isLoopbackActive -> CyanNeon
-                        connectionState is ConnectionState.Connected -> GreenConnected
-                        else -> TextSecondary
-                    },
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.ExtraBold,
-                    letterSpacing = 1.sp
+                    text = if (isHeadsetPlugged) "🎧 3.5mm HEADSET" else audioRoute.label.uppercase(),
+                    color = if (isHeadsetPlugged) GreenConnected else TextSecondary,
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold
                 )
             }
 
@@ -667,7 +717,7 @@ fun RadioHudCard(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Column {
+                Column(modifier = Modifier.weight(1f)) {
                     Text(
                         text = when (connectionState) {
                             is ConnectionState.Connected -> connectionState.deviceName
@@ -681,9 +731,9 @@ fun RadioHudCard(
                     )
                     Text(
                         text = when (connectionState) {
-                            is ConnectionState.Connected -> "Peer: ${connectionState.deviceAddress}"
+                            is ConnectionState.Connected -> "Peer: ${connectionState.deviceAddress} • ${if (autoConnectEnabled) "Auto-Reconnecting" else "Manual"}"
                             is ConnectionState.Listening -> "Listening on RFCOMM (SPP)"
-                            else -> if (isLoopbackActive) "Testing microphone & speaker locally" else "Tap 'Connect' above to link phones"
+                            else -> if (isLoopbackActive) "Testing microphone & speaker locally" else "Tap 'Connect' or use Auto-Connect"
                         },
                         color = TextSecondary,
                         fontSize = 11.sp
@@ -765,12 +815,13 @@ fun ModeSelectorBar(
 
 @Composable
 fun ControlsToolbar(
-    isSpeakerphone: Boolean,
+    currentRoute: AudioRoute,
+    isHeadsetPlugged: Boolean,
     isMuted: Boolean,
     isRogerBeep: Boolean,
     isLoopback: Boolean,
     micGain: Float,
-    onToggleSpeaker: () -> Unit,
+    onCycleRoute: () -> Unit,
     onToggleMute: () -> Unit,
     onToggleRoger: () -> Unit,
     onToggleLoopback: () -> Unit,
@@ -788,14 +839,22 @@ fun ControlsToolbar(
             horizontalArrangement = Arrangement.SpaceEvenly,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // Speakerphone toggle
+            // Audio Jack Headset / Speakerphone cycle button
             TacticalButton(
-                icon = if (isSpeakerphone) Icons.Default.VolumeUp else Icons.Default.VolumeDown,
-                label = if (isSpeakerphone) "Speaker" else "Earpiece",
-                isActive = isSpeakerphone,
-                activeColor = CyanNeon,
-                onClick = onToggleSpeaker,
-                testTag = "toggle_speaker_button"
+                icon = when (currentRoute) {
+                    AudioRoute.HEADSET_OR_AUTO -> Icons.Default.Headphones
+                    AudioRoute.SPEAKERPHONE -> Icons.Default.VolumeUp
+                    AudioRoute.EARPIECE -> Icons.Default.VolumeDown
+                },
+                label = when (currentRoute) {
+                    AudioRoute.HEADSET_OR_AUTO -> if (isHeadsetPlugged) "3.5mm Jack" else "Headset/Auto"
+                    AudioRoute.SPEAKERPHONE -> "Speaker"
+                    AudioRoute.EARPIECE -> "Earpiece"
+                },
+                isActive = isHeadsetPlugged || currentRoute == AudioRoute.HEADSET_OR_AUTO,
+                activeColor = if (isHeadsetPlugged) GreenConnected else CyanNeon,
+                onClick = onCycleRoute,
+                testTag = "cycle_route_button"
             )
 
             // Mic Mute toggle
@@ -927,6 +986,8 @@ fun TacticalButton(
 @Composable
 fun ConnectionFooterCard(
     connectionState: ConnectionState,
+    autoConnectEnabled: Boolean,
+    lastTargetName: String?,
     onOpenDevices: () -> Unit,
     onStartListening: () -> Unit,
     onDisconnect: () -> Unit,
@@ -959,7 +1020,7 @@ fun ConnectionFooterCard(
                             is ConnectionState.Connected -> "Direct Link Active"
                             is ConnectionState.Listening -> "Listening for Peer"
                             is ConnectionState.Connecting -> "Establishing Link"
-                            ConnectionState.Disconnected -> "P2P Bluetooth Link"
+                            ConnectionState.Disconnected -> if (autoConnectEnabled && lastTargetName != null) "Auto-Connect Ready" else "P2P Bluetooth Link"
                         },
                         color = TextPrimary,
                         fontSize = 13.sp,
@@ -967,9 +1028,9 @@ fun ConnectionFooterCard(
                     )
                     Text(
                         text = when (connectionState) {
-                            is ConnectionState.Connected -> "Low-latency voice & audio streaming"
+                            is ConnectionState.Connected -> "Hi-Fi audio streaming with zero cutouts"
                             is ConnectionState.Listening -> "Ready for incoming connection"
-                            else -> "No Wi-Fi or Internet required"
+                            else -> if (autoConnectEnabled && lastTargetName != null) "Will reconnect to $lastTargetName" else "Tap 'Pair / Scan' or Settings"
                         },
                         color = TextSecondary,
                         fontSize = 11.sp

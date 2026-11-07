@@ -17,6 +17,7 @@ import com.example.model.ConnectionState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -28,6 +29,7 @@ import java.io.BufferedOutputStream
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.IOException
+import java.nio.ByteBuffer
 import java.util.UUID
 import java.util.concurrent.LinkedBlockingQueue
 
@@ -47,6 +49,7 @@ class BluetoothAudioService(
         const val TYPE_PTT_END: Byte = 0x03
         const val TYPE_PING: Byte = 0x04
         const val TYPE_TEXT: Byte = 0x05
+        const val TYPE_CONFIG: Byte = 0x07 // Transmits sample rate & audio config
     }
 
     private val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
@@ -301,17 +304,26 @@ class BluetoothAudioService(
         connectedWorker?.queuePacket(TYPE_TEXT, bytes)
     }
 
+    fun sendConfig(sampleRate: Int) {
+        val bytes = ByteBuffer.allocate(4).putInt(sampleRate).array()
+        connectedWorker?.queuePacket(TYPE_CONFIG, bytes)
+    }
+
     private inner class ConnectedWorker(private val socket: BluetoothSocket) {
         @Volatile
         private var isRunning = true
-        private val inStream = DataInputStream(BufferedInputStream(socket.inputStream, 16384))
-        private val outStream = DataOutputStream(BufferedOutputStream(socket.outputStream, 16384))
+        private val inStream = DataInputStream(BufferedInputStream(socket.inputStream, 32768))
+        private val outStream = DataOutputStream(BufferedOutputStream(socket.outputStream, 32768))
 
-        // Strict FIFO thread-safe packet send queue (prevents coroutine explosion and byte interleaving)
-        private val sendQueue = LinkedBlockingQueue<Pair<Byte, ByteArray>>(120)
+        // Generous FIFO queue capacity (300 packets = ~6 seconds of buffer to absorb Bluetooth bursts)
+        private val sendQueue = LinkedBlockingQueue<Pair<Byte, ByteArray>>(300)
 
         private var readJob: Job? = null
         private var writeJob: Job? = null
+        private var keepAliveJob: Job? = null
+
+        @Volatile
+        private var lastSendTime = System.currentTimeMillis()
 
         fun start() {
             // Dedicated Single-Threaded Write Loop
@@ -326,10 +338,21 @@ class BluetoothAudioService(
                             outStream.write(payload)
                         }
                         outStream.flush()
+                        lastSendTime = System.currentTimeMillis()
                     }
                 } catch (e: Exception) {
                     Log.d(TAG, "Writer loop ended: ${e.message}")
                     onDisconnectOccurred()
+                }
+            }
+
+            // Keep-Alive Heartbeat Job (prevents Bluetooth controller sleep and random cutouts)
+            keepAliveJob = scope.launch {
+                while (isActive && isRunning) {
+                    delay(3000)
+                    if (System.currentTimeMillis() - lastSendTime > 2500) {
+                        queuePacket(TYPE_PING, ByteArray(0))
+                    }
                 }
             }
 
@@ -354,8 +377,7 @@ class BluetoothAudioService(
 
                         // Read Payload length (short)
                         val length = inStream.readShort().toInt() and 0xFFFF
-                        if (length > 16384) {
-                            // Unreasonable packet length indicates stream misalignment; skip
+                        if (length > 32768) {
                             Log.w(TAG, "Excessive payload length $length, resyncing...")
                             continue
                         }
@@ -382,8 +404,8 @@ class BluetoothAudioService(
 
         fun queuePacket(type: Byte, payload: ByteArray) {
             if (!isRunning) return
-            // If queue is nearly full, drop oldest audio frames to avoid latency buildup
-            if (sendQueue.remainingCapacity() < 10 && type == TYPE_AUDIO) {
+            // If queue reaches critical max capacity, drop oldest packet to maintain realtime
+            if (sendQueue.remainingCapacity() < 5 && type == TYPE_AUDIO) {
                 sendQueue.poll()
             }
             sendQueue.offer(Pair(type, payload))
@@ -404,6 +426,7 @@ class BluetoothAudioService(
             isRunning = false
             readJob?.cancel()
             writeJob?.cancel()
+            keepAliveJob?.cancel()
             sendQueue.clear()
             try {
                 socket.close()

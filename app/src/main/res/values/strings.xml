@@ -1,0 +1,16 @@
+<resources>
+    <string name="app_name">BlueVoice</string>
+    <string name="bt_walkie_talkie">Bluetooth Walkie-Talkie</string>
+    <string name="ptt_hold_to_talk">HOLD TO TALK</string>
+    <string name="ptt_release_to_listen">RELEASE TO LISTEN</string>
+    <string name="open_mic_label">Hands-Free Mic</string>
+    <string name="audio_streaming_status">Audio Status</string>
+    <string name="connecting">Connecting...</string>
+    <string name="connected">Connected</string>
+    <string name="disconnected">Disconnected</string>
+    <string name="listening_for_incoming">Waiting for connection...</string>
+    <string name="make_discoverable">Make Discoverable</string>
+    <string name="scan_devices">Scan for Devices</string>
+    <string name="paired_devices">Paired Devices</string>
+    <string name="available_devices">Available Nearby Devices</string>
+</resources>

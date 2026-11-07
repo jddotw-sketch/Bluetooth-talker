@@ -1,0 +1,6 @@
+{
+  "name": "BlueVoice",
+  "description": "Communicate with nearby phones over Bluetooth with real-time push-to-talk audio streaming, walkie-talkie mode, and peer-to-peer intercom.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

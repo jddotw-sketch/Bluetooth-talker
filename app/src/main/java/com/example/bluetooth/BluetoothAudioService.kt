@@ -1,0 +1,391 @@
+package com.example.bluetooth
+
+import android.annotation.SuppressLint
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothServerSocket
+import android.bluetooth.BluetoothSocket
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.os.Build
+import android.util.Log
+import com.example.model.BluetoothDeviceInfo
+import com.example.model.ConnectionState
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
+import java.io.DataInputStream
+import java.io.DataOutputStream
+import java.io.IOException
+import java.util.UUID
+
+class BluetoothAudioService(
+    private val context: Context,
+    private val onPacketReceived: (type: Byte, payload: ByteArray) -> Unit
+) {
+    companion object {
+        private const val TAG = "BluetoothAudioService"
+        private const val SERVICE_NAME = "BlueVoiceAudio"
+        // Standard SPP UUID for maximum cross-device Bluetooth compatibility
+        val SPP_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
+
+        // Packet Protocol
+        const val MAGIC_BYTE: Byte = 0x5A
+        const val TYPE_AUDIO: Byte = 0x01
+        const val TYPE_PTT_START: Byte = 0x02
+        const val TYPE_PTT_END: Byte = 0x03
+        const val TYPE_PING: Byte = 0x04
+        const val TYPE_TEXT: Byte = 0x05
+    }
+
+    private val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+    val bluetoothAdapter: BluetoothAdapter? = bluetoothManager?.adapter
+
+    private val _connectionState = MutableStateFlow<ConnectionState>(ConnectionState.Disconnected)
+    val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
+
+    private val _discoveredDevices = MutableStateFlow<List<BluetoothDeviceInfo>>(emptyList())
+    val discoveredDevices: StateFlow<List<BluetoothDeviceInfo>> = _discoveredDevices.asStateFlow()
+
+    private val _isScanning = MutableStateFlow(false)
+    val isScanning: StateFlow<Boolean> = _isScanning.asStateFlow()
+
+    private val scope = CoroutineScope(Dispatchers.IO)
+    private var acceptJob: Job? = null
+    private var connectJob: Job? = null
+    private var connectedWorker: ConnectedWorker? = null
+    private var serverSocket: BluetoothServerSocket? = null
+
+    private var isReceiverRegistered = false
+
+    private val discoveryReceiver = object : BroadcastReceiver() {
+        @SuppressLint("MissingPermission")
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                BluetoothDevice.ACTION_FOUND -> {
+                    val device: BluetoothDevice? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+                    }
+                    val rssi = intent.getShortExtra(BluetoothDevice.EXTRA_RSSI, Short.MIN_VALUE)
+
+                    device?.let { dev ->
+                        val name = try {
+                            dev.name ?: dev.address
+                        } catch (e: SecurityException) {
+                            dev.address
+                        }
+                        val info = BluetoothDeviceInfo(
+                            name = name,
+                            address = dev.address,
+                            isPaired = dev.bondState == BluetoothDevice.BOND_BONDED,
+                            rssi = if (rssi != Short.MIN_VALUE) rssi else null
+                        )
+
+                        val currentList = _discoveredDevices.value.toMutableList()
+                        val index = currentList.indexOfFirst { it.address == info.address }
+                        if (index >= 0) {
+                            currentList[index] = info
+                        } else {
+                            currentList.add(info)
+                        }
+                        _discoveredDevices.value = currentList
+                    }
+                }
+                BluetoothAdapter.ACTION_DISCOVERY_FINISHED -> {
+                    _isScanning.value = false
+                }
+            }
+        }
+    }
+
+    init {
+        registerDiscoveryReceiver()
+    }
+
+    private fun registerDiscoveryReceiver() {
+        if (!isReceiverRegistered) {
+            val filter = IntentFilter().apply {
+                addAction(BluetoothDevice.ACTION_FOUND)
+                addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED)
+            }
+            context.registerReceiver(discoveryReceiver, filter)
+            isReceiverRegistered = true
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    fun getPairedDevices(): List<BluetoothDeviceInfo> {
+        val adapter = bluetoothAdapter ?: return emptyList()
+        return try {
+            adapter.bondedDevices?.map { dev ->
+                BluetoothDeviceInfo(
+                    name = dev.name ?: dev.address,
+                    address = dev.address,
+                    isPaired = true
+                )
+            } ?: emptyList()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to get bonded devices: ${e.message}")
+            emptyList()
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    fun startDiscovery() {
+        val adapter = bluetoothAdapter ?: return
+        try {
+            if (adapter.isDiscovering) {
+                adapter.cancelDiscovery()
+            }
+            _discoveredDevices.value = emptyList()
+            _isScanning.value = adapter.startDiscovery()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error starting discovery: ${e.message}")
+            _isScanning.value = false
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    fun stopDiscovery() {
+        try {
+            bluetoothAdapter?.cancelDiscovery()
+            _isScanning.value = false
+        } catch (e: Exception) {
+            Log.e(TAG, "Error stopping discovery: ${e.message}")
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    fun startListening() {
+        val adapter = bluetoothAdapter ?: return
+        stopListening()
+        disconnectCurrentConnection()
+
+        val localName = try {
+            adapter.name ?: "This Phone"
+        } catch (e: Exception) {
+            "This Phone"
+        }
+
+        _connectionState.value = ConnectionState.Listening(localName)
+
+        acceptJob = scope.launch {
+            try {
+                serverSocket = adapter.listenUsingRfcommWithServiceRecord(SERVICE_NAME, SPP_UUID)
+                Log.d(TAG, "Listening on RFCOMM for incoming connection...")
+                val socket = serverSocket?.accept()
+                if (socket != null) {
+                    serverSocket?.close()
+                    serverSocket = null
+                    val remoteDev = socket.remoteDevice
+                    val remoteName = try {
+                        remoteDev.name ?: remoteDev.address
+                    } catch (e: Exception) {
+                        remoteDev.address
+                    }
+                    withContext(Dispatchers.Main) {
+                        _connectionState.value = ConnectionState.Connected(remoteName, remoteDev.address)
+                    }
+                    connectedWorker = ConnectedWorker(socket)
+                    connectedWorker?.start()
+                }
+            } catch (e: IOException) {
+                Log.d(TAG, "Server socket closed or interrupted: ${e.message}")
+                if (_connectionState.value is ConnectionState.Listening) {
+                    withContext(Dispatchers.Main) {
+                        _connectionState.value = ConnectionState.Disconnected
+                    }
+                }
+            }
+        }
+    }
+
+    fun stopListening() {
+        acceptJob?.cancel()
+        acceptJob = null
+        try {
+            serverSocket?.close()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error closing server socket: ${e.message}")
+        }
+        serverSocket = null
+    }
+
+    @SuppressLint("MissingPermission")
+    fun connectToDevice(deviceAddress: String, deviceName: String? = null) {
+        val adapter = bluetoothAdapter ?: return
+        stopListening()
+        disconnectCurrentConnection()
+
+        val name = deviceName ?: deviceAddress
+        _connectionState.value = ConnectionState.Connecting(name, deviceAddress)
+
+        connectJob = scope.launch {
+            try {
+                adapter.cancelDiscovery()
+                val device = adapter.getRemoteDevice(deviceAddress)
+                var socket: BluetoothSocket? = null
+
+                // Attempt standard SPP UUID connection first
+                try {
+                    socket = device.createRfcommSocketToServiceRecord(SPP_UUID)
+                    socket.connect()
+                } catch (e: IOException) {
+                    Log.w(TAG, "Standard RFCOMM failed, attempting reflection fallback: ${e.message}")
+                    socket?.close()
+                    // Reflection fallback to port 1 for devices that don't publish SDP records properly
+                    val fallbackMethod = device.javaClass.getMethod("createRfcommSocket", Int::class.javaPrimitiveType)
+                    socket = fallbackMethod.invoke(device, 1) as BluetoothSocket
+                    socket.connect()
+                }
+
+                if (socket != null && socket.isConnected) {
+                    withContext(Dispatchers.Main) {
+                        _connectionState.value = ConnectionState.Connected(name, deviceAddress)
+                    }
+                    connectedWorker = ConnectedWorker(socket)
+                    connectedWorker?.start()
+                } else {
+                    throw IOException("Socket could not connect")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Connection failed: ${e.message}")
+                withContext(Dispatchers.Main) {
+                    _connectionState.value = ConnectionState.Disconnected
+                }
+            }
+        }
+    }
+
+    fun disconnect() {
+        stopListening()
+        disconnectCurrentConnection()
+        _connectionState.value = ConnectionState.Disconnected
+    }
+
+    private fun disconnectCurrentConnection() {
+        connectJob?.cancel()
+        connectJob = null
+        connectedWorker?.cancel()
+        connectedWorker = null
+    }
+
+    fun sendPacket(type: Byte, payload: ByteArray) {
+        connectedWorker?.send(type, payload)
+    }
+
+    fun sendAudio(data: ByteArray) {
+        sendPacket(TYPE_AUDIO, data)
+    }
+
+    fun sendPttStart() {
+        sendPacket(TYPE_PTT_START, ByteArray(0))
+    }
+
+    fun sendPttEnd() {
+        sendPacket(TYPE_PTT_END, ByteArray(0))
+    }
+
+    fun sendTextMessage(text: String) {
+        val bytes = text.toByteArray(Charsets.UTF_8)
+        sendPacket(TYPE_TEXT, bytes)
+    }
+
+    private inner class ConnectedWorker(private val socket: BluetoothSocket) {
+        private var isRunning = true
+        private val inStream = DataInputStream(BufferedInputStream(socket.inputStream, 8192))
+        private val outStream = DataOutputStream(BufferedOutputStream(socket.outputStream, 8192))
+        private var workerJob: Job? = null
+
+        fun start() {
+            workerJob = scope.launch {
+                try {
+                    while (isActive && isRunning) {
+                        // Scan for Magic Byte 0x5A
+                        var byte = inStream.readByte()
+                        while (byte != MAGIC_BYTE) {
+                            byte = inStream.readByte()
+                        }
+
+                        // Read packet type (1 byte)
+                        val type = inStream.readByte()
+
+                        // Read payload length (2 bytes short)
+                        val length = inStream.readShort().toInt() and 0xFFFF
+                        val payload = ByteArray(length)
+                        if (length > 0) {
+                            inStream.readFully(payload, 0, length)
+                        }
+
+                        onPacketReceived(type, payload)
+                    }
+                } catch (e: Exception) {
+                    Log.d(TAG, "Connection terminated: ${e.message}")
+                    if (isRunning) {
+                        withContext(Dispatchers.Main) {
+                            _connectionState.value = ConnectionState.Disconnected
+                        }
+                    }
+                } finally {
+                    cancel()
+                }
+            }
+        }
+
+        fun send(type: Byte, payload: ByteArray) {
+            scope.launch {
+                try {
+                    synchronized(outStream) {
+                        outStream.writeByte(MAGIC_BYTE.toInt())
+                        outStream.writeByte(type.toInt())
+                        outStream.writeShort(payload.size)
+                        if (payload.isNotEmpty()) {
+                            outStream.write(payload)
+                        }
+                        outStream.flush()
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error writing to socket: ${e.message}")
+                }
+            }
+        }
+
+        fun cancel() {
+            isRunning = false
+            workerJob?.cancel()
+            workerJob = null
+            try {
+                socket.close()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error closing socket: ${e.message}")
+            }
+        }
+    }
+
+    fun cleanup() {
+        stopDiscovery()
+        disconnect()
+        if (isReceiverRegistered) {
+            try {
+                context.unregisterReceiver(discoveryReceiver)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error unregistering receiver: ${e.message}")
+            }
+            isReceiverRegistered = false
+        }
+    }
+}

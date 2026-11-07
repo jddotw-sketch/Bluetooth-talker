@@ -1,17 +1,24 @@
 package com.example.viewmodel
 
+import android.app.Activity
 import android.app.Application
-import android.bluetooth.BluetoothAdapter
+import android.content.Context
+import android.content.Intent
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.audio.AudioStreamManager
 import com.example.bluetooth.BluetoothAudioService
+import com.example.model.AudioSourceMode
 import com.example.model.BluetoothDeviceInfo
 import com.example.model.ChatMessage
 import com.example.model.ConnectionState
 import com.example.model.WalkieMode
+import com.example.service.AudioRelayService
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -24,6 +31,7 @@ data class WalkieTalkieUiState(
     val permissionsGranted: Boolean = false,
     val connectionState: ConnectionState = ConnectionState.Disconnected,
     val walkieMode: WalkieMode = WalkieMode.PUSH_TO_TALK,
+    val audioSourceMode: AudioSourceMode = AudioSourceMode.MICROPHONE,
     val isTransmitting: Boolean = false,
     val isReceivingAudio: Boolean = false,
     val isLoopbackTestActive: Boolean = false,
@@ -39,7 +47,8 @@ data class WalkieTalkieUiState(
     val chatMessages: List<ChatMessage> = emptyList(),
     val showDeviceDialog: Boolean = false,
     val showQuickMessageSheet: Boolean = false,
-    val statusNotification: String? = null
+    val statusNotification: String? = null,
+    val requiresMediaProjectionConsent: Boolean = false
 )
 
 class WalkieTalkieViewModel(application: Application) : AndroidViewModel(application) {
@@ -49,6 +58,8 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var rxTimeoutRunnable: Runnable? = null
+
+    private val mediaProjectionManager = application.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as? MediaProjectionManager
 
     val audioService: BluetoothAudioService = BluetoothAudioService(application) { type, payload ->
         handleIncomingPacket(type, payload)
@@ -65,7 +76,7 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
             if (isTx) {
                 _uiState.update { it.copy(txAudioLevel = amplitude) }
             } else {
-                _uiState.update { it.copy(rxAudioLevel = amplitude, isReceivingAudio = amplitude > 0.05f) }
+                _uiState.update { it.copy(rxAudioLevel = amplitude, isReceivingAudio = amplitude > 0.03f) }
                 resetRxAudioTimeout()
             }
         }
@@ -131,7 +142,7 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
 
     fun startListening() {
         audioService.startListening()
-        showStatusNotification("Listening for incoming connections...")
+        showStatusNotification("Listening for incoming connection...")
     }
 
     fun stopListening() {
@@ -162,13 +173,55 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
         audioService.stopDiscovery()
     }
 
+    fun setAudioSourceMode(mode: AudioSourceMode) {
+        if (_uiState.value.audioSourceMode == mode) return
+
+        if (_uiState.value.isTransmitting) {
+            stopTransmitting()
+        }
+
+        _uiState.update { it.copy(audioSourceMode = mode) }
+
+        if (mode == AudioSourceMode.APP_AUDIO_RELAY) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                if (audioStreamManager.mediaProjection == null) {
+                    _uiState.update { it.copy(requiresMediaProjectionConsent = true) }
+                } else {
+                    showStatusNotification("Audio Relay active - Streaming all system & app audio")
+                }
+            } else {
+                showStatusNotification("Audio Relay requires Android 10 or newer")
+            }
+        } else {
+            AudioRelayService.stop(getApplication())
+            showStatusNotification("Switched to Microphone Walkie-Talkie")
+        }
+    }
+
+    fun getMediaProjectionIntent(): Intent? {
+        return mediaProjectionManager?.createScreenCaptureIntent()
+    }
+
+    fun onMediaProjectionResult(resultCode: Int, data: Intent?) {
+        _uiState.update { it.copy(requiresMediaProjectionConsent = false) }
+        if (resultCode == Activity.RESULT_OK && data != null && mediaProjectionManager != null) {
+            AudioRelayService.start(getApplication())
+            val projection = mediaProjectionManager.getMediaProjection(resultCode, data)
+            audioStreamManager.mediaProjection = projection
+            showStatusNotification("Audio Relay ready - Streams YouTube, music & game audio")
+        } else {
+            _uiState.update { it.copy(audioSourceMode = AudioSourceMode.MICROPHONE) }
+            showStatusNotification("Audio capture permission denied")
+        }
+    }
+
     fun onPttPressed() {
         if (_uiState.value.isTransmitting) return
         startTransmitting()
     }
 
     fun onPttReleased() {
-        if (_uiState.value.walkieMode == WalkieMode.PUSH_TO_TALK) {
+        if (_uiState.value.walkieMode == WalkieMode.PUSH_TO_TALK && _uiState.value.audioSourceMode != AudioSourceMode.APP_AUDIO_RELAY) {
             stopTransmitting()
         }
     }
@@ -190,7 +243,7 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
         )
     }
 
-    fun toggleOpenMicTransmission() {
+    fun toggleTransmission() {
         if (_uiState.value.isTransmitting) {
             stopTransmitting()
         } else {
@@ -212,8 +265,15 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
         if (isConnected && !isLoopback) {
             audioService.sendPttStart()
         }
-        audioStreamManager.playPttStartChirp()
-        audioStreamManager.startRecording(loopbackMode = isLoopback)
+
+        if (_uiState.value.audioSourceMode == AudioSourceMode.MICROPHONE) {
+            audioStreamManager.playPttStartChirp()
+        }
+
+        audioStreamManager.startRecording(
+            sourceMode = _uiState.value.audioSourceMode,
+            loopbackMode = isLoopback
+        )
     }
 
     private fun stopTransmitting() {
@@ -226,7 +286,10 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
         if (isConnected && !isLoopback) {
             audioService.sendPttEnd()
         }
-        audioStreamManager.playRogerBeep()
+
+        if (_uiState.value.audioSourceMode == AudioSourceMode.MICROPHONE) {
+            audioStreamManager.playRogerBeep()
+        }
     }
 
     fun toggleLoopbackTest() {
@@ -343,12 +406,13 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
         rxTimeoutRunnable = Runnable {
             _uiState.update { it.copy(isReceivingAudio = false, rxAudioLevel = 0f) }
         }
-        mainHandler.postDelayed(rxTimeoutRunnable!!, 350)
+        mainHandler.postDelayed(rxTimeoutRunnable!!, 400)
     }
 
     override fun onCleared() {
         super.onCleared()
         rxTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+        AudioRelayService.stop(getApplication())
         audioStreamManager.release()
         audioService.cleanup()
     }

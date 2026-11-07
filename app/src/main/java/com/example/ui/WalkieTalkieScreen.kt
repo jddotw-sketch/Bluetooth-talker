@@ -35,9 +35,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Bluetooth
 import androidx.compose.material.icons.filled.BluetoothConnected
 import androidx.compose.material.icons.filled.Chat
-import androidx.compose.material.icons.filled.Check
-import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.GraphicEq
+import androidx.compose.material.icons.filled.Headphones
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
 import androidx.compose.material.icons.filled.Notifications
@@ -46,7 +45,6 @@ import androidx.compose.material.icons.filled.Radio
 import androidx.compose.material.icons.filled.Sensors
 import androidx.compose.material.icons.filled.SettingsVoice
 import androidx.compose.material.icons.filled.VolumeDown
-import androidx.compose.material.icons.filled.VolumeMute
 import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -59,13 +57,11 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -79,6 +75,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.model.AudioSourceMode
 import com.example.model.ConnectionState
 import com.example.model.WalkieMode
 import com.example.ui.components.DeviceSelectionSheet
@@ -109,12 +106,35 @@ fun WalkieTalkieScreen(
     val uiState by viewModel.uiState.collectAsState()
     val scrollState = rememberScrollState()
 
-    // Permission launcher
+    // Permission launcher for standard Bluetooth/Audio
     val permissionsLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
     ) { results ->
         val allGranted = results.values.all { it }
         viewModel.setPermissionsGranted(allGranted)
+    }
+
+    // MediaProjection launcher for Audio Relay (system/app audio capture)
+    val mediaProjectionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        viewModel.onMediaProjectionResult(result.resultCode, result.data)
+    }
+
+    // Trigger MediaProjection consent when Audio Relay is selected
+    LaunchedEffect(uiState.requiresMediaProjectionConsent) {
+        if (uiState.requiresMediaProjectionConsent) {
+            val intent = viewModel.getMediaProjectionIntent()
+            if (intent != null) {
+                try {
+                    mediaProjectionLauncher.launch(intent)
+                } catch (e: Exception) {
+                    viewModel.onMediaProjectionResult(android.app.Activity.RESULT_CANCELED, null)
+                }
+            } else {
+                viewModel.onMediaProjectionResult(android.app.Activity.RESULT_CANCELED, null)
+            }
+        }
     }
 
     // Discoverable intent launcher
@@ -126,12 +146,16 @@ fun WalkieTalkieScreen(
 
     LaunchedEffect(Unit) {
         val requiredPerms = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            arrayOf(
+            val perms = mutableListOf(
                 Manifest.permission.RECORD_AUDIO,
                 Manifest.permission.BLUETOOTH_CONNECT,
                 Manifest.permission.BLUETOOTH_SCAN,
                 Manifest.permission.BLUETOOTH_ADVERTISE
             )
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                perms.add(Manifest.permission.POST_NOTIFICATIONS)
+            }
+            perms.toTypedArray()
         } else {
             arrayOf(
                 Manifest.permission.RECORD_AUDIO,
@@ -143,7 +167,7 @@ fun WalkieTalkieScreen(
         permissionsLauncher.launch(requiredPerms)
     }
 
-    // Auto-clear notification toast after 3 seconds
+    // Auto-clear notification toast after 3.5 seconds
     LaunchedEffect(uiState.statusNotification) {
         if (uiState.statusNotification != null) {
             delay(3500)
@@ -178,6 +202,14 @@ fun WalkieTalkieScreen(
                     chatCount = uiState.chatMessages.size,
                     onOpenDevices = { viewModel.setDeviceDialogVisible(true) },
                     onOpenChat = { viewModel.setQuickMessageSheetVisible(true) }
+                )
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                // Audio Source Mode Switcher: Microphone Walkie-Talkie vs App Audio Relay
+                AudioSourceSelectorBar(
+                    currentSource = uiState.audioSourceMode,
+                    onSelectSource = { viewModel.setAudioSourceMode(it) }
                 )
 
                 Spacer(modifier = Modifier.height(10.dp))
@@ -225,6 +257,7 @@ fun WalkieTalkieScreen(
                 RadioHudCard(
                     connectionState = uiState.connectionState,
                     walkieMode = uiState.walkieMode,
+                    audioSourceMode = uiState.audioSourceMode,
                     isTransmitting = uiState.isTransmitting,
                     isReceiving = uiState.isReceivingAudio,
                     isLoopbackActive = uiState.isLoopbackTestActive,
@@ -247,6 +280,7 @@ fun WalkieTalkieScreen(
                 // Walkie-Talkie Core PTT Button
                 PttButton(
                     walkieMode = uiState.walkieMode,
+                    audioSourceMode = uiState.audioSourceMode,
                     isTransmitting = uiState.isTransmitting,
                     isReceiving = uiState.isReceivingAudio,
                     isMuted = uiState.isMuted,
@@ -255,18 +289,19 @@ fun WalkieTalkieScreen(
                     txLevel = uiState.txAudioLevel,
                     onPttPress = { viewModel.onPttPressed() },
                     onPttRelease = { viewModel.onPttReleased() },
-                    onOpenMicToggle = { viewModel.toggleOpenMicTransmission() }
+                    onToggleTransmission = { viewModel.toggleTransmission() }
                 )
 
                 Spacer(modifier = Modifier.height(18.dp))
 
-                // Mode Selector Segmented Chips
-                ModeSelectorBar(
-                    currentMode = uiState.walkieMode,
-                    onToggleMode = { viewModel.toggleWalkieMode() }
-                )
-
-                Spacer(modifier = Modifier.height(14.dp))
+                // Mode Selector Segmented Chips (Only applicable in Microphone mode)
+                if (uiState.audioSourceMode == AudioSourceMode.MICROPHONE) {
+                    ModeSelectorBar(
+                        currentMode = uiState.walkieMode,
+                        onToggleMode = { viewModel.toggleWalkieMode() }
+                    )
+                    Spacer(modifier = Modifier.height(14.dp))
+                }
 
                 // Tactical Control Toolbar
                 ControlsToolbar(
@@ -335,6 +370,79 @@ fun WalkieTalkieScreen(
 }
 
 @Composable
+fun AudioSourceSelectorBar(
+    currentSource: AudioSourceMode,
+    onSelectSource: (AudioSourceMode) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = SlateCard),
+        shape = RoundedCornerShape(24.dp),
+        border = androidx.compose.foundation.BorderStroke(1.dp, SlateCardBorder),
+        modifier = modifier.fillMaxWidth()
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(4.dp),
+            horizontalArrangement = Arrangement.SpaceEvenly
+        ) {
+            FilledTonalButton(
+                onClick = { onSelectSource(AudioSourceMode.MICROPHONE) },
+                colors = ButtonDefaults.filledTonalButtonColors(
+                    containerColor = if (currentSource == AudioSourceMode.MICROPHONE) BlueAccent else Color.Transparent
+                ),
+                shape = RoundedCornerShape(20.dp),
+                modifier = Modifier
+                    .weight(1f)
+                    .height(38.dp)
+                    .testTag("source_mic_button")
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Mic,
+                    contentDescription = null,
+                    tint = if (currentSource == AudioSourceMode.MICROPHONE) Color.White else TextSecondary,
+                    modifier = Modifier.size(16.dp)
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    text = "Walkie-Talkie",
+                    color = if (currentSource == AudioSourceMode.MICROPHONE) Color.White else TextSecondary,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+
+            FilledTonalButton(
+                onClick = { onSelectSource(AudioSourceMode.APP_AUDIO_RELAY) },
+                colors = ButtonDefaults.filledTonalButtonColors(
+                    containerColor = if (currentSource == AudioSourceMode.APP_AUDIO_RELAY) Color(0xFF651FFF) else Color.Transparent
+                ),
+                shape = RoundedCornerShape(20.dp),
+                modifier = Modifier
+                    .weight(1f)
+                    .height(38.dp)
+                    .testTag("source_relay_button")
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Headphones,
+                    contentDescription = null,
+                    tint = if (currentSource == AudioSourceMode.APP_AUDIO_RELAY) Color.White else TextSecondary,
+                    modifier = Modifier.size(16.dp)
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    text = "Audio Relay (All Apps)",
+                    color = if (currentSource == AudioSourceMode.APP_AUDIO_RELAY) Color.White else TextSecondary,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
+    }
+}
+
+@Composable
 fun TopBarSection(
     connectionState: ConnectionState,
     chatCount: Int,
@@ -372,7 +480,7 @@ fun TopBarSection(
                     letterSpacing = 0.5.sp
                 )
                 Text(
-                    text = "Bluetooth Audio Stream",
+                    text = "Walkie-Talkie & Audio Relay",
                     color = TextSecondary,
                     fontSize = 11.sp
                 )
@@ -464,6 +572,7 @@ fun TopBarSection(
 fun RadioHudCard(
     connectionState: ConnectionState,
     walkieMode: WalkieMode,
+    audioSourceMode: AudioSourceMode,
     isTransmitting: Boolean,
     isReceiving: Boolean,
     isLoopbackActive: Boolean,
@@ -477,6 +586,7 @@ fun RadioHudCard(
         border = androidx.compose.foundation.BorderStroke(
             1.5.dp,
             when {
+                isTransmitting && audioSourceMode == AudioSourceMode.APP_AUDIO_RELAY -> CyanNeon
                 isTransmitting -> AmberTransmitting
                 isReceiving -> GreenConnected
                 isLoopbackActive -> CyanNeon
@@ -505,6 +615,7 @@ fun RadioHudCard(
                             .clip(CircleShape)
                             .background(
                                 when {
+                                    isTransmitting && audioSourceMode == AudioSourceMode.APP_AUDIO_RELAY -> CyanNeon
                                     isTransmitting -> AmberTransmitting
                                     isReceiving -> GreenConnected
                                     connectionState is ConnectionState.Connected -> GreenConnected
@@ -515,7 +626,7 @@ fun RadioHudCard(
                     )
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
-                        text = "CH-01 • 16 kHz HD VOICE",
+                        text = if (audioSourceMode == AudioSourceMode.APP_AUDIO_RELAY) "AUDIO RELAY • SYSTEM MEDIA" else "CH-01 • 16 kHz HD VOICE",
                         color = TextSecondary,
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Bold,
@@ -526,6 +637,7 @@ fun RadioHudCard(
                 // Status tag
                 Text(
                     text = when {
+                        isTransmitting && audioSourceMode == AudioSourceMode.APP_AUDIO_RELAY -> "RELAYING AUDIO"
                         isTransmitting -> "TRANSMITTING"
                         isReceiving -> "RECEIVING"
                         isLoopbackActive -> "MIC TEST ACTIVE"
@@ -534,6 +646,7 @@ fun RadioHudCard(
                         else -> "STANDBY"
                     },
                     color = when {
+                        isTransmitting && audioSourceMode == AudioSourceMode.APP_AUDIO_RELAY -> CyanNeon
                         isTransmitting -> AmberTransmitting
                         isReceiving -> GreenConnected
                         isLoopbackActive -> CyanNeon
@@ -854,7 +967,7 @@ fun ConnectionFooterCard(
                     )
                     Text(
                         text = when (connectionState) {
-                            is ConnectionState.Connected -> "Low-latency voice streaming"
+                            is ConnectionState.Connected -> "Low-latency voice & audio streaming"
                             is ConnectionState.Listening -> "Ready for incoming connection"
                             else -> "No Wi-Fi or Internet required"
                         },
@@ -892,7 +1005,7 @@ fun ConnectionFooterCard(
                         onClick = onOpenDevices,
                         colors = ButtonDefaults.buttonColors(containerColor = BlueAccent),
                         shape = RoundedCornerShape(16.dp),
-                        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 14.dp, vertical = 6.dp),
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 6.dp),
                         modifier = Modifier.height(34.dp)
                     ) {
                         Text("Pair / Scan", fontSize = 11.sp, fontWeight = FontWeight.Bold)

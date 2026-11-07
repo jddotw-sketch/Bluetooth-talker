@@ -20,15 +20,14 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
 import androidx.compose.material.icons.filled.Radio
 import androidx.compose.material3.Icon
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -41,6 +40,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.model.AudioSourceMode
 import com.example.model.WalkieMode
 import com.example.ui.theme.AmberGlow
 import com.example.ui.theme.AmberTransmitting
@@ -58,6 +58,7 @@ import com.example.ui.theme.TextSecondary
 @Composable
 fun PttButton(
     walkieMode: WalkieMode,
+    audioSourceMode: AudioSourceMode,
     isTransmitting: Boolean,
     isReceiving: Boolean,
     isMuted: Boolean,
@@ -66,10 +67,12 @@ fun PttButton(
     txLevel: Float,
     onPttPress: () -> Unit,
     onPttRelease: () -> Unit,
-    onOpenMicToggle: () -> Unit,
+    onToggleTransmission: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val view = LocalView.current
+
+    val isAudioRelay = audioSourceMode == AudioSourceMode.APP_AUDIO_RELAY
 
     // Infinite pulsing rings when transmitting
     val infiniteTransition = rememberInfiniteTransition(label = "ptt_pulse")
@@ -100,9 +103,11 @@ fun PttButton(
 
     val coreBgColor by animateColorAsState(
         targetValue = when {
+            isTransmitting && isAudioRelay -> CyanNeon
             isTransmitting -> AmberTransmitting
             isReceiving -> GreenConnected
             isMuted -> RedMuted
+            isAudioRelay -> Color(0xFF651FFF)
             walkieMode == WalkieMode.OPEN_MIC -> CyanNeon.copy(alpha = 0.85f)
             isConnected || isLoopbackActive -> BlueAccent
             else -> SlateSurface
@@ -112,8 +117,10 @@ fun PttButton(
 
     val coreBorderColor by animateColorAsState(
         targetValue = when {
+            isTransmitting && isAudioRelay -> CyanNeon
             isTransmitting -> AmberTransmitting
             isReceiving -> GreenConnected
+            isAudioRelay -> Color(0xFF7C4DFF)
             walkieMode == WalkieMode.OPEN_MIC -> CyanNeon
             else -> SlateCardBorder
         },
@@ -133,7 +140,9 @@ fun PttButton(
                     .size(210.dp)
                     .scale(pulseScale + (txLevel * 0.2f))
                     .clip(CircleShape)
-                    .background(AmberGlow.copy(alpha = pulseAlpha))
+                    .background(
+                        if (isAudioRelay) CyanNeon.copy(alpha = pulseAlpha * 0.6f) else AmberGlow.copy(alpha = pulseAlpha)
+                    )
             )
         }
 
@@ -162,7 +171,11 @@ fun PttButton(
                 .background(
                     Brush.verticalGradient(
                         colors = if (isTransmitting) {
-                            listOf(AmberTransmitting, Color(0xFFE65100))
+                            if (isAudioRelay) {
+                                listOf(CyanNeon, Color(0xFF0091EA))
+                            } else {
+                                listOf(AmberTransmitting, Color(0xFFE65100))
+                            }
                         } else {
                             listOf(SlateCard, SlateDark)
                         }
@@ -170,8 +183,16 @@ fun PttButton(
                 )
                 .border(3.dp, coreBorderColor, CircleShape)
                 .testTag("ptt_button")
-                .pointerInput(walkieMode, isConnected, isLoopbackActive) {
-                    if (walkieMode == WalkieMode.PUSH_TO_TALK) {
+                .pointerInput(walkieMode, audioSourceMode, isConnected, isLoopbackActive) {
+                    if (isAudioRelay || walkieMode == WalkieMode.OPEN_MIC) {
+                        detectTapGestures(
+                            onTap = {
+                                view.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                                onToggleTransmission()
+                            }
+                        )
+                    } else {
+                        // Standard Push-To-Talk
                         detectTapGestures(
                             onPress = {
                                 view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
@@ -184,14 +205,6 @@ fun PttButton(
                                 }
                             }
                         )
-                    } else {
-                        // OPEN_MIC Mode: tap to toggle mic
-                        detectTapGestures(
-                            onTap = {
-                                view.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
-                                onOpenMicToggle()
-                            }
-                        )
                     }
                 },
             contentAlignment = Alignment.Center
@@ -202,6 +215,7 @@ fun PttButton(
             ) {
                 Icon(
                     imageVector = when {
+                        isAudioRelay -> Icons.Default.GraphicEq
                         isMuted -> Icons.Default.MicOff
                         isTransmitting -> Icons.Default.Radio
                         else -> Icons.Default.Mic
@@ -215,8 +229,10 @@ fun PttButton(
 
                 Text(
                     text = when {
+                        isTransmitting && isAudioRelay -> "RELAYING"
                         isTransmitting -> "LIVE ON AIR"
                         isReceiving -> "RECEIVING"
+                        isAudioRelay -> "TAP TO STREAM"
                         walkieMode == WalkieMode.OPEN_MIC -> "TAP TO TALK"
                         else -> "HOLD TO TALK"
                     },
@@ -228,6 +244,7 @@ fun PttButton(
 
                 Text(
                     text = when {
+                        isAudioRelay -> if (isTransmitting) "APP AUDIO LIVE" else "AUDIO RELAY"
                         isTransmitting -> "TRANSMITTING"
                         walkieMode == WalkieMode.OPEN_MIC -> "OPEN MIC"
                         else -> "PTT MODE"

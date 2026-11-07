@@ -5,21 +5,23 @@ import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
+import android.media.AudioPlaybackCaptureConfiguration
 import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
+import android.media.projection.MediaProjection
 import android.os.Build
 import android.util.Log
+import com.example.model.AudioSourceMode
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.LinkedBlockingQueue
 import kotlin.math.PI
-import kotlin.math.abs
 import kotlin.math.sin
 import kotlin.math.sqrt
 
@@ -40,7 +42,12 @@ class AudioStreamManager(
     private var audioRecord: AudioRecord? = null
     private var audioTrack: AudioTrack? = null
 
+    // Single-threaded playback queue (CRITICAL: prevents concurrent AudioTrack.write SIGSEGV crashes)
+    private val playbackQueue = LinkedBlockingQueue<ByteArray>(80)
+    private var playbackJob: Job? = null
+
     private var recordingJob: Job? = null
+    @Volatile
     private var isRecording = false
     private var isLoopback = false
 
@@ -48,8 +55,16 @@ class AudioStreamManager(
     var isMuted: Boolean = false
     var rogerBeepEnabled: Boolean = true
 
+    // MediaProjection instance for Audio Relay (capturing all app/system audio)
+    var mediaProjection: MediaProjection? = null
+
+    // Throttle amplitude UI updates to ~20 fps (every 50ms)
+    private var lastTxAmplitudeTime = 0L
+    private var lastRxAmplitudeTime = 0L
+
     init {
         initAudioTrack()
+        startPlaybackWorker()
     }
 
     private fun initAudioTrack() {
@@ -62,7 +77,7 @@ class AudioStreamManager(
             val bufferSize = maxOf(minBufSize * 2, 4096)
 
             val audioAttributes = AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                .setUsage(AudioAttributes.USAGE_MEDIA)
                 .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                 .build()
 
@@ -79,9 +94,41 @@ class AudioStreamManager(
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .build()
 
-            audioTrack?.play()
+            if (audioTrack?.state == AudioTrack.STATE_INITIALIZED) {
+                audioTrack?.play()
+            } else {
+                Log.e(TAG, "AudioTrack failed to initialize")
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to init AudioTrack: ${e.message}")
+        }
+    }
+
+    private fun startPlaybackWorker() {
+        playbackJob?.cancel()
+        playbackJob = scope.launch {
+            while (isActive) {
+                try {
+                    val data = playbackQueue.take()
+                    if (audioTrack == null || audioTrack?.state != AudioTrack.STATE_INITIALIZED) {
+                        initAudioTrack()
+                    }
+                    audioTrack?.let { track ->
+                        if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
+                            try {
+                                track.play()
+                            } catch (e: Exception) {
+                                Log.e(TAG, "Error starting playback: ${e.message}")
+                            }
+                        }
+                        track.write(data, 0, data.size)
+                    }
+                } catch (e: InterruptedException) {
+                    break
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error in playback worker: ${e.message}")
+                }
+            }
         }
     }
 
@@ -99,7 +146,7 @@ class AudioStreamManager(
     }
 
     @SuppressLint("MissingPermission")
-    fun startRecording(loopbackMode: Boolean = false) {
+    fun startRecording(sourceMode: AudioSourceMode = AudioSourceMode.MICROPHONE, loopbackMode: Boolean = false) {
         if (isRecording) return
         isLoopback = loopbackMode
 
@@ -111,31 +158,58 @@ class AudioStreamManager(
             )
             val bufferSize = maxOf(minBufSize * 2, CHUNK_SIZE * 4)
 
-            // Prefer VOICE_COMMUNICATION for echo cancellation / noise suppression
-            val source = try {
-                MediaRecorder.AudioSource.VOICE_COMMUNICATION
-            } catch (e: Exception) {
-                MediaRecorder.AudioSource.MIC
+            // AUDIO RELAY (Capture internal device & app audio on Android 10+)
+            if (sourceMode == AudioSourceMode.APP_AUDIO_RELAY && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && mediaProjection != null) {
+                try {
+                    val captureConfig = AudioPlaybackCaptureConfiguration.Builder(mediaProjection!!)
+                        .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                        .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                        .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                        .build()
+
+                    val audioFormat = AudioFormat.Builder()
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(SAMPLE_RATE)
+                        .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
+                        .build()
+
+                    audioRecord = AudioRecord.Builder()
+                        .setAudioPlaybackCaptureConfig(captureConfig)
+                        .setAudioFormat(audioFormat)
+                        .setBufferSizeInBytes(bufferSize)
+                        .build()
+                } catch (e: Exception) {
+                    Log.e(TAG, "AudioPlaybackCapture creation failed, falling back to MIC: ${e.message}")
+                    audioRecord = null
+                }
             }
 
-            audioRecord = AudioRecord(
-                source,
-                SAMPLE_RATE,
-                AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT,
-                bufferSize
-            )
+            // Fallback / Standard Microphone
+            if (audioRecord == null) {
+                val source = try {
+                    MediaRecorder.AudioSource.VOICE_COMMUNICATION
+                } catch (e: Exception) {
+                    MediaRecorder.AudioSource.MIC
+                }
 
-            if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
-                Log.w(TAG, "AudioRecord VOICE_COMMUNICATION failed, retrying with MIC")
-                audioRecord?.release()
                 audioRecord = AudioRecord(
-                    MediaRecorder.AudioSource.MIC,
+                    source,
                     SAMPLE_RATE,
                     AudioFormat.CHANNEL_IN_MONO,
                     AudioFormat.ENCODING_PCM_16BIT,
                     bufferSize
                 )
+
+                if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
+                    audioRecord?.release()
+                    audioRecord = AudioRecord(
+                        MediaRecorder.AudioSource.MIC,
+                        SAMPLE_RATE,
+                        AudioFormat.CHANNEL_IN_MONO,
+                        AudioFormat.ENCODING_PCM_16BIT,
+                        bufferSize
+                    )
+                }
             }
 
             if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
@@ -151,16 +225,16 @@ class AudioStreamManager(
                 while (isActive && isRecording) {
                     val readBytes = audioRecord?.read(buffer, 0, buffer.size) ?: -1
                     if (readBytes > 0) {
-                        val processedBuffer = if (isMuted) {
+                        val processed = if (isMuted) {
                             ByteArray(readBytes)
                         } else {
                             applyGainAndCalculateAmplitude(buffer, readBytes, isTx = true)
                         }
 
                         if (isLoopback) {
-                            playIncomingAudio(processedBuffer)
+                            playIncomingAudio(processed)
                         } else {
-                            onAudioPacketReady(processedBuffer)
+                            onAudioPacketReady(processed)
                         }
                     }
                 }
@@ -186,25 +260,25 @@ class AudioStreamManager(
     }
 
     fun playIncomingAudio(data: ByteArray) {
-        try {
-            if (audioTrack == null || audioTrack?.state != AudioTrack.STATE_INITIALIZED) {
-                initAudioTrack()
-            }
-            audioTrack?.let { track ->
-                if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
-                    track.play()
-                }
-                track.write(data, 0, data.size)
-                // Calculate incoming audio amplitude for the visualizer
-                calculateAmplitude(data, data.size, isTx = false)
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error playing audio: ${e.message}")
+        if (data.isEmpty()) return
+        // Offer to single-threaded playback queue
+        if (playbackQueue.remainingCapacity() < 5) {
+            playbackQueue.poll() // Discard oldest packet if lagging to keep realtime
+        }
+        playbackQueue.offer(data)
+
+        // Calculate amplitude for visualizer (safely throttled)
+        val now = System.currentTimeMillis()
+        if (now - lastRxAmplitudeTime > 45) {
+            lastRxAmplitudeTime = now
+            calculateAmplitude(data, data.size, isTx = false)
         }
     }
 
     private fun applyGainAndCalculateAmplitude(buffer: ByteArray, length: Int, isTx: Boolean): ByteArray {
-        val shortArray = ShortArray(length / 2)
+        if (length < 2) return buffer
+        val numSamples = length / 2
+        val shortArray = ShortArray(numSamples)
         ByteBuffer.wrap(buffer, 0, length)
             .order(ByteOrder.LITTLE_ENDIAN)
             .asShortBuffer()
@@ -213,16 +287,20 @@ class AudioStreamManager(
         var sumSquare = 0.0
         val gain = micGain.coerceIn(0.5f, 3.5f)
 
-        for (i in shortArray.indices) {
+        for (i in 0 until numSamples) {
             val amplified = (shortArray[i] * gain).toInt().coerceIn(-32768, 32767).toShort()
             shortArray[i] = amplified
             sumSquare += (amplified * amplified).toDouble()
         }
 
-        val rms = sqrt(sumSquare / shortArray.size)
-        // Normalize 0.0 to 1.0 (typical voice rms ranges 500 to 12000)
-        val normalized = (rms / 9000.0).toFloat().coerceIn(0f, 1f)
-        onAmplitudeChanged(isTx, normalized)
+        val now = System.currentTimeMillis()
+        if (now - lastTxAmplitudeTime > 45) {
+            lastTxAmplitudeTime = now
+            val mean = if (numSamples > 0) sumSquare / numSamples else 0.0
+            val rms = sqrt(mean)
+            val normalized = if (rms.isNaN()) 0f else (rms / 9000.0).toFloat().coerceIn(0f, 1f)
+            onAmplitudeChanged(isTx, normalized)
+        }
 
         val output = ByteArray(length)
         ByteBuffer.wrap(output)
@@ -234,48 +312,39 @@ class AudioStreamManager(
     }
 
     private fun calculateAmplitude(buffer: ByteArray, length: Int, isTx: Boolean) {
-        val shortArray = ShortArray(length / 2)
+        if (length < 2) return
+        val numSamples = length / 2
+        val shortArray = ShortArray(numSamples)
         ByteBuffer.wrap(buffer, 0, length)
             .order(ByteOrder.LITTLE_ENDIAN)
             .asShortBuffer()
             .get(shortArray)
 
         var sumSquare = 0.0
-        for (sample in shortArray) {
-            sumSquare += (sample * sample).toDouble()
+        for (i in 0 until numSamples) {
+            val s = shortArray[i].toDouble()
+            sumSquare += (s * s)
         }
-        val rms = sqrt(sumSquare / shortArray.size)
-        val normalized = (rms / 9000.0).toFloat().coerceIn(0f, 1f)
+        val mean = if (numSamples > 0) sumSquare / numSamples else 0.0
+        val rms = sqrt(mean)
+        val normalized = if (rms.isNaN()) 0f else (rms / 9000.0).toFloat().coerceIn(0f, 1f)
         onAmplitudeChanged(isTx, normalized)
     }
 
     fun playPttStartChirp() {
         scope.launch {
-            val chirp = generateTone(frequencyHz = 1400.0, durationMs = 45, volume = 0.35f)
-            playDirectly(chirp)
+            val chirp = generateTone(frequencyHz = 1400.0, durationMs = 40, volume = 0.3f)
+            playbackQueue.offer(chirp)
         }
     }
 
     fun playRogerBeep() {
         if (!rogerBeepEnabled) return
         scope.launch {
-            val tone1 = generateTone(frequencyHz = 1200.0, durationMs = 60, volume = 0.35f)
-            val tone2 = generateTone(frequencyHz = 950.0, durationMs = 60, volume = 0.35f)
-            val silence = ByteArray(320) // 10ms gap
-            playDirectly(tone1 + silence + tone2)
-        }
-    }
-
-    private fun playDirectly(data: ByteArray) {
-        try {
-            audioTrack?.let { track ->
-                if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
-                    track.play()
-                }
-                track.write(data, 0, data.size)
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "playDirectly error: ${e.message}")
+            val tone1 = generateTone(frequencyHz = 1200.0, durationMs = 50, volume = 0.3f)
+            val tone2 = generateTone(frequencyHz = 950.0, durationMs = 50, volume = 0.3f)
+            val silence = ByteArray(320)
+            playbackQueue.offer(tone1 + silence + tone2)
         }
     }
 
@@ -284,7 +353,6 @@ class AudioStreamManager(
         val shortArray = ShortArray(numSamples)
         for (i in 0 until numSamples) {
             val angle = 2.0 * PI * i * frequencyHz / SAMPLE_RATE
-            // Apply slight envelope (attack and decay) to prevent audio clicks
             val envelope = when {
                 i < numSamples * 0.1 -> i / (numSamples * 0.1)
                 i > numSamples * 0.9 -> (numSamples - i) / (numSamples * 0.1)
@@ -302,6 +370,8 @@ class AudioStreamManager(
 
     fun release() {
         stopRecording()
+        playbackJob?.cancel()
+        playbackQueue.clear()
         try {
             audioTrack?.stop()
             audioTrack?.release()
@@ -309,5 +379,7 @@ class AudioStreamManager(
             Log.e(TAG, "release error: ${e.message}")
         }
         audioTrack = null
+        mediaProjection?.stop()
+        mediaProjection = null
     }
 }

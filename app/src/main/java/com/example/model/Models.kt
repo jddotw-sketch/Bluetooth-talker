@@ -19,6 +19,11 @@ enum class WalkieMode {
     OPEN_MIC
 }
 
+enum class AudioSourceMode {
+    MICROPHONE,       // Voice walkie-talkie / intercom
+    APP_AUDIO_RELAY   // Streams internal music, games, video, and app audio to peer
+}
+
 data class ChatMessage(
     val id: String = java.util.UUID.randomUUID().toString(),
     val senderName: String,

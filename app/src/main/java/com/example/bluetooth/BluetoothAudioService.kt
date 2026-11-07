@@ -29,6 +29,7 @@ import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.IOException
 import java.util.UUID
+import java.util.concurrent.LinkedBlockingQueue
 
 class BluetoothAudioService(
     private val context: Context,
@@ -37,10 +38,9 @@ class BluetoothAudioService(
     companion object {
         private const val TAG = "BluetoothAudioService"
         private const val SERVICE_NAME = "BlueVoiceAudio"
-        // Standard SPP UUID for maximum cross-device Bluetooth compatibility
         val SPP_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
 
-        // Packet Protocol
+        // Protocol Magic & Types
         const val MAGIC_BYTE: Byte = 0x5A
         const val TYPE_AUDIO: Byte = 0x01
         const val TYPE_PTT_START: Byte = 0x02
@@ -240,14 +240,14 @@ class BluetoothAudioService(
                 val device = adapter.getRemoteDevice(deviceAddress)
                 var socket: BluetoothSocket? = null
 
-                // Attempt standard SPP UUID connection first
+                // 1. Try standard SPP UUID
                 try {
                     socket = device.createRfcommSocketToServiceRecord(SPP_UUID)
                     socket.connect()
                 } catch (e: IOException) {
                     Log.w(TAG, "Standard RFCOMM failed, attempting reflection fallback: ${e.message}")
                     socket?.close()
-                    // Reflection fallback to port 1 for devices that don't publish SDP records properly
+                    // 2. Reflection fallback for non-standard device Bluetooth stacks
                     val fallbackMethod = device.javaClass.getMethod("createRfcommSocket", Int::class.javaPrimitiveType)
                     socket = fallbackMethod.invoke(device, 1) as BluetoothSocket
                     socket.connect()
@@ -284,72 +284,41 @@ class BluetoothAudioService(
         connectedWorker = null
     }
 
-    fun sendPacket(type: Byte, payload: ByteArray) {
-        connectedWorker?.send(type, payload)
-    }
-
     fun sendAudio(data: ByteArray) {
-        sendPacket(TYPE_AUDIO, data)
+        connectedWorker?.queuePacket(TYPE_AUDIO, data)
     }
 
     fun sendPttStart() {
-        sendPacket(TYPE_PTT_START, ByteArray(0))
+        connectedWorker?.queuePacket(TYPE_PTT_START, ByteArray(0))
     }
 
     fun sendPttEnd() {
-        sendPacket(TYPE_PTT_END, ByteArray(0))
+        connectedWorker?.queuePacket(TYPE_PTT_END, ByteArray(0))
     }
 
     fun sendTextMessage(text: String) {
         val bytes = text.toByteArray(Charsets.UTF_8)
-        sendPacket(TYPE_TEXT, bytes)
+        connectedWorker?.queuePacket(TYPE_TEXT, bytes)
     }
 
     private inner class ConnectedWorker(private val socket: BluetoothSocket) {
+        @Volatile
         private var isRunning = true
-        private val inStream = DataInputStream(BufferedInputStream(socket.inputStream, 8192))
-        private val outStream = DataOutputStream(BufferedOutputStream(socket.outputStream, 8192))
-        private var workerJob: Job? = null
+        private val inStream = DataInputStream(BufferedInputStream(socket.inputStream, 16384))
+        private val outStream = DataOutputStream(BufferedOutputStream(socket.outputStream, 16384))
+
+        // Strict FIFO thread-safe packet send queue (prevents coroutine explosion and byte interleaving)
+        private val sendQueue = LinkedBlockingQueue<Pair<Byte, ByteArray>>(120)
+
+        private var readJob: Job? = null
+        private var writeJob: Job? = null
 
         fun start() {
-            workerJob = scope.launch {
+            // Dedicated Single-Threaded Write Loop
+            writeJob = scope.launch {
                 try {
                     while (isActive && isRunning) {
-                        // Scan for Magic Byte 0x5A
-                        var byte = inStream.readByte()
-                        while (byte != MAGIC_BYTE) {
-                            byte = inStream.readByte()
-                        }
-
-                        // Read packet type (1 byte)
-                        val type = inStream.readByte()
-
-                        // Read payload length (2 bytes short)
-                        val length = inStream.readShort().toInt() and 0xFFFF
-                        val payload = ByteArray(length)
-                        if (length > 0) {
-                            inStream.readFully(payload, 0, length)
-                        }
-
-                        onPacketReceived(type, payload)
-                    }
-                } catch (e: Exception) {
-                    Log.d(TAG, "Connection terminated: ${e.message}")
-                    if (isRunning) {
-                        withContext(Dispatchers.Main) {
-                            _connectionState.value = ConnectionState.Disconnected
-                        }
-                    }
-                } finally {
-                    cancel()
-                }
-            }
-        }
-
-        fun send(type: Byte, payload: ByteArray) {
-            scope.launch {
-                try {
-                    synchronized(outStream) {
+                        val (type, payload) = sendQueue.take()
                         outStream.writeByte(MAGIC_BYTE.toInt())
                         outStream.writeByte(type.toInt())
                         outStream.writeShort(payload.size)
@@ -359,15 +328,83 @@ class BluetoothAudioService(
                         outStream.flush()
                     }
                 } catch (e: Exception) {
-                    Log.e(TAG, "Error writing to socket: ${e.message}")
+                    Log.d(TAG, "Writer loop ended: ${e.message}")
+                    onDisconnectOccurred()
+                }
+            }
+
+            // Dedicated Single-Threaded Read Loop
+            readJob = scope.launch {
+                try {
+                    while (isActive && isRunning) {
+                        // Scan for Magic Byte with EOF detection
+                        var b = inStream.read()
+                        if (b == -1) {
+                            Log.d(TAG, "EOF received from remote peer")
+                            break
+                        }
+                        while (b != MAGIC_BYTE.toInt()) {
+                            b = inStream.read()
+                            if (b == -1) break
+                        }
+                        if (b == -1) break
+
+                        // Read Type
+                        val type = inStream.readByte()
+
+                        // Read Payload length (short)
+                        val length = inStream.readShort().toInt() and 0xFFFF
+                        if (length > 16384) {
+                            // Unreasonable packet length indicates stream misalignment; skip
+                            Log.w(TAG, "Excessive payload length $length, resyncing...")
+                            continue
+                        }
+
+                        val payload = ByteArray(length)
+                        if (length > 0) {
+                            inStream.readFully(payload, 0, length)
+                        }
+
+                        // Safely dispatch to listener
+                        try {
+                            onPacketReceived(type, payload)
+                        } catch (t: Throwable) {
+                            Log.e(TAG, "Error in onPacketReceived callback: ${t.message}")
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.d(TAG, "Reader loop ended: ${e.message}")
+                } finally {
+                    onDisconnectOccurred()
+                }
+            }
+        }
+
+        fun queuePacket(type: Byte, payload: ByteArray) {
+            if (!isRunning) return
+            // If queue is nearly full, drop oldest audio frames to avoid latency buildup
+            if (sendQueue.remainingCapacity() < 10 && type == TYPE_AUDIO) {
+                sendQueue.poll()
+            }
+            sendQueue.offer(Pair(type, payload))
+        }
+
+        private fun onDisconnectOccurred() {
+            if (!isRunning) return
+            isRunning = false
+            cancel()
+            scope.launch(Dispatchers.Main) {
+                if (_connectionState.value is ConnectionState.Connected) {
+                    _connectionState.value = ConnectionState.Disconnected
                 }
             }
         }
 
         fun cancel() {
             isRunning = false
-            workerJob?.cancel()
-            workerJob = null
+            readJob?.cancel()
+            writeJob?.cancel()
+            sendQueue.clear()
             try {
                 socket.close()
             } catch (e: Exception) {

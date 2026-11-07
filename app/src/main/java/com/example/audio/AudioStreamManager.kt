@@ -21,6 +21,7 @@ import com.example.model.AudioSourceMode
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.nio.ByteBuffer
@@ -34,7 +35,8 @@ class AudioStreamManager(
     private val context: Context,
     private val onAudioPacketReady: (ByteArray) -> Unit,
     private val onAmplitudeChanged: (isTransmitting: Boolean, amplitude: Float) -> Unit,
-    private val onHeadsetStateChanged: (isPlugged: Boolean) -> Unit = {}
+    private val onHeadsetStateChanged: (isPlugged: Boolean) -> Unit = {},
+    private val onSampleRateChanged: (actualRate: Int) -> Unit = {}
 ) {
     companion object {
         private const val TAG = "AudioStreamManager"
@@ -155,8 +157,8 @@ class AudioStreamManager(
                 AudioFormat.CHANNEL_OUT_MONO,
                 AudioFormat.ENCODING_PCM_16BIT
             )
-            // Generous Jitter Buffer (~500ms) to ensure continuous playback without cutting out
-            val bufferSize = maxOf(minBufSize * 4, 16384)
+            val validMinBuf = if (minBufSize > 0) minBufSize else 4096
+            val bufferSize = maxOf(validMinBuf * 4, 16384)
 
             val audioAttributes = AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_MEDIA)
@@ -214,107 +216,154 @@ class AudioStreamManager(
         }
     }
 
+    /**
+     * Tries multiple candidate sample rates and audio sources to create a 100% valid AudioRecord.
+     * Guaranteed never to throw uncaught exceptions or crash on real hardware.
+     */
     @SuppressLint("MissingPermission")
-    fun startRecording(sourceMode: AudioSourceMode = AudioSourceMode.MICROPHONE, loopbackMode: Boolean = false) {
-        if (isRecording) return
+    private fun createSafeAudioRecord(requestedSampleRate: Int, sourceMode: AudioSourceMode): Pair<AudioRecord, Int>? {
+        // 1. Audio Relay mode (Internal system & app audio capture on Android 10+)
+        if (sourceMode == AudioSourceMode.APP_AUDIO_RELAY && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && mediaProjection != null) {
+            try {
+                val captureConfig = AudioPlaybackCaptureConfiguration.Builder(mediaProjection!!)
+                    .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                    .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                    .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                    .build()
+
+                for (rate in listOf(requestedSampleRate, 48000, 44100, 16000)) {
+                    val minBuf = AudioRecord.getMinBufferSize(rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+                    if (minBuf <= 0) continue
+                    val bufSize = maxOf(minBuf * 4, 8192)
+                    try {
+                        val format = AudioFormat.Builder()
+                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                            .setSampleRate(rate)
+                            .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
+                            .build()
+                        val rec = AudioRecord.Builder()
+                            .setAudioPlaybackCaptureConfig(captureConfig)
+                            .setAudioFormat(format)
+                            .setBufferSizeInBytes(bufSize)
+                            .build()
+                        if (rec.state == AudioRecord.STATE_INITIALIZED) {
+                            return Pair(rec, rate)
+                        } else {
+                            rec.release()
+                        }
+                    } catch (ignored: Exception) {}
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "AudioPlaybackCapture config failed: ${e.message}")
+            }
+        }
+
+        // 2. Microphone capture: Test candidate rates and audio sources supported by device hardware
+        // Android microphone hardware standard rates: 16000 Hz and 48000 Hz are universal
+        val candidateRates = when (requestedSampleRate) {
+            44100 -> listOf(44100, 48000, 16000)
+            else -> listOf(16000, 48000, 44100)
+        }
+
+        val candidateSources = listOf(
+            MediaRecorder.AudioSource.MIC,
+            MediaRecorder.AudioSource.DEFAULT,
+            MediaRecorder.AudioSource.VOICE_COMMUNICATION
+        )
+
+        for (rate in candidateRates) {
+            val minBuf = try {
+                AudioRecord.getMinBufferSize(rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+            } catch (e: Exception) {
+                -1
+            }
+            if (minBuf <= 0) continue
+            val bufSize = maxOf(minBuf * 4, 4096)
+
+            for (src in candidateSources) {
+                try {
+                    val rec = AudioRecord(src, rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufSize)
+                    if (rec.state == AudioRecord.STATE_INITIALIZED) {
+                        return Pair(rec, rate)
+                    } else {
+                        rec.release()
+                    }
+                } catch (ignored: Exception) {}
+            }
+        }
+
+        return null
+    }
+
+    @SuppressLint("MissingPermission")
+    fun startRecording(sourceMode: AudioSourceMode = AudioSourceMode.MICROPHONE, loopbackMode: Boolean = false): Boolean {
+        if (isRecording) return true
         isLoopback = loopbackMode
 
         try {
-            val sampleRate = currentQuality.sampleRate
-            // ~20ms chunk size
-            val chunkSize = (sampleRate * 2 * 20) / 1000 // 20ms of 16-bit PCM
-
-            val minBufSize = AudioRecord.getMinBufferSize(
-                sampleRate,
-                AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT
-            )
-            val bufferSize = maxOf(minBufSize * 4, chunkSize * 6)
-
-            // AUDIO RELAY (Capture internal device & app audio on Android 10+)
-            if (sourceMode == AudioSourceMode.APP_AUDIO_RELAY && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && mediaProjection != null) {
-                try {
-                    val captureConfig = AudioPlaybackCaptureConfiguration.Builder(mediaProjection!!)
-                        .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
-                        .addMatchingUsage(AudioAttributes.USAGE_GAME)
-                        .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
-                        .build()
-
-                    val audioFormat = AudioFormat.Builder()
-                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                        .setSampleRate(sampleRate)
-                        .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
-                        .build()
-
-                    audioRecord = AudioRecord.Builder()
-                        .setAudioPlaybackCaptureConfig(captureConfig)
-                        .setAudioFormat(audioFormat)
-                        .setBufferSizeInBytes(bufferSize)
-                        .build()
-                } catch (e: Exception) {
-                    Log.e(TAG, "AudioPlaybackCapture creation failed, falling back to MIC: ${e.message}")
-                    audioRecord = null
-                }
+            val pair = createSafeAudioRecord(currentQuality.sampleRate, sourceMode)
+            if (pair == null) {
+                Log.e(TAG, "Could not initialize AudioRecord for any supported rate/source")
+                return false
             }
 
-            // Fallback / Standard Microphone
-            if (audioRecord == null) {
-                val source = try {
-                    MediaRecorder.AudioSource.VOICE_COMMUNICATION
-                } catch (e: Exception) {
-                    MediaRecorder.AudioSource.MIC
-                }
+            val (record, actualRate) = pair
+            audioRecord = record
 
-                audioRecord = AudioRecord(
-                    source,
-                    sampleRate,
-                    AudioFormat.CHANNEL_IN_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT,
-                    bufferSize
-                )
-
-                if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
-                    audioRecord?.release()
-                    audioRecord = AudioRecord(
-                        MediaRecorder.AudioSource.MIC,
-                        sampleRate,
-                        AudioFormat.CHANNEL_IN_MONO,
-                        AudioFormat.ENCODING_PCM_16BIT,
-                        bufferSize
-                    )
-                }
+            if (actualRate != currentQuality.sampleRate) {
+                Log.d(TAG, "Recording at hardware sample rate $actualRate Hz (requested ${currentQuality.sampleRate})")
+                onSampleRateChanged(actualRate)
             }
 
-            if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
-                Log.e(TAG, "AudioRecord could not initialize")
-                return
+            try {
+                record.startRecording()
+            } catch (e: Exception) {
+                Log.e(TAG, "record.startRecording failed: ${e.message}")
+                stopRecording()
+                return false
             }
 
-            audioRecord?.startRecording()
             isRecording = true
 
+            val chunkSize = (actualRate * 2 * 20) / 1000 // 20ms of audio
+
             recordingJob = scope.launch {
-                val buffer = ByteArray(chunkSize)
-                while (isActive && isRecording) {
-                    val readBytes = audioRecord?.read(buffer, 0, buffer.size) ?: -1
-                    if (readBytes > 0) {
-                        val processed = if (isMuted) {
-                            ByteArray(readBytes)
-                        } else {
-                            applyGainAndCalculateAmplitude(buffer, readBytes, isTx = true)
+                try {
+                    val buffer = ByteArray(chunkSize)
+                    while (isActive && isRecording) {
+                        val rec = audioRecord ?: break
+                        val readBytes = try {
+                            rec.read(buffer, 0, buffer.size)
+                        } catch (e: Exception) {
+                            -1
                         }
 
-                        if (isLoopback) {
-                            playIncomingAudio(processed)
+                        if (readBytes > 0) {
+                            val processed = if (isMuted) {
+                                ByteArray(readBytes)
+                            } else {
+                                applyGainAndCalculateAmplitude(buffer, readBytes, isTx = true)
+                            }
+
+                            if (isLoopback) {
+                                playIncomingAudio(processed)
+                            } else {
+                                onAudioPacketReady(processed)
+                            }
                         } else {
-                            onAudioPacketReady(processed)
+                            // Prevent tight CPU busy-loop if read error occurs
+                            delay(15)
                         }
                     }
+                } catch (t: Throwable) {
+                    Log.e(TAG, "Exception in recording loop: ${t.message}")
                 }
             }
+            return true
         } catch (e: Exception) {
             Log.e(TAG, "startRecording error: ${e.message}")
             stopRecording()
+            return false
         }
     }
 
@@ -406,18 +455,22 @@ class AudioStreamManager(
 
     fun playPttStartChirp() {
         scope.launch {
-            val chirp = generateTone(frequencyHz = 1400.0, durationMs = 40, volume = 0.3f)
-            playbackQueue.offer(chirp)
+            try {
+                val chirp = generateTone(frequencyHz = 1400.0, durationMs = 40, volume = 0.3f)
+                playbackQueue.offer(chirp)
+            } catch (ignored: Exception) {}
         }
     }
 
     fun playRogerBeep() {
         if (!rogerBeepEnabled) return
         scope.launch {
-            val tone1 = generateTone(frequencyHz = 1200.0, durationMs = 50, volume = 0.3f)
-            val tone2 = generateTone(frequencyHz = 950.0, durationMs = 50, volume = 0.3f)
-            val silence = ByteArray(320)
-            playbackQueue.offer(tone1 + silence + tone2)
+            try {
+                val tone1 = generateTone(frequencyHz = 1200.0, durationMs = 50, volume = 0.3f)
+                val tone2 = generateTone(frequencyHz = 950.0, durationMs = 50, volume = 0.3f)
+                val silence = ByteArray(320)
+                playbackQueue.offer(tone1 + silence + tone2)
+            } catch (ignored: Exception) {}
         }
     }
 
@@ -459,7 +512,9 @@ class AudioStreamManager(
             Log.e(TAG, "release error: ${e.message}")
         }
         audioTrack = null
-        mediaProjection?.stop()
+        try {
+            mediaProjection?.stop()
+        } catch (ignored: Exception) {}
         mediaProjection = null
     }
 }

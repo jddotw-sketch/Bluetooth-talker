@@ -5,7 +5,6 @@ import android.app.Application
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
-import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Handler
@@ -38,9 +37,9 @@ data class WalkieTalkieUiState(
     val permissionsGranted: Boolean = false,
     val connectionState: ConnectionState = ConnectionState.Disconnected,
     val walkieMode: WalkieMode = WalkieMode.PUSH_TO_TALK,
-    val audioSourceMode: AudioSourceMode = AudioSourceMode.APP_AUDIO_RELAY, // Default to Audio Relay as requested
-    val audioQuality: AudioQuality = AudioQuality.HI_FI_44K,               // Default to Hi-Fi LDAC-style 44.1kHz
-    val audioRoute: AudioRoute = AudioRoute.HEADSET_OR_AUTO,              // Default to 3.5mm Headset / Auto
+    val audioSourceMode: AudioSourceMode = AudioSourceMode.MICROPHONE, // Default to Microphone Walkie-Talkie
+    val audioQuality: AudioQuality = AudioQuality.HI_FI_44K,           // Hi-Fi quality mode
+    val audioRoute: AudioRoute = AudioRoute.HEADSET_OR_AUTO,          // 3.5mm Headset / Auto
     val isHeadsetPlugged: Boolean = false,
     val autoConnectEnabled: Boolean = true,
     val lastConnectedDeviceName: String? = null,
@@ -67,6 +66,7 @@ data class WalkieTalkieUiState(
 class WalkieTalkieViewModel(application: Application) : AndroidViewModel(application) {
 
     companion object {
+        private const val TAG = "WalkieTalkieVM"
         private const val PREFS_NAME = "bluevoice_prefs"
         private const val KEY_AUTO_CONNECT = "auto_connect_enabled"
         private const val KEY_LAST_ADDR = "last_connected_addr"
@@ -126,6 +126,11 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
             showStatusNotification(
                 if (isPlugged) "Headset plugged in 🎧 - Audio routed to 3.5mm jack" else "Headset unplugged"
             )
+        },
+        onSampleRateChanged = { actualRate ->
+            if (_uiState.value.connectionState is ConnectionState.Connected) {
+                audioService.sendConfig(actualRate)
+            }
         }
     )
 
@@ -322,10 +327,16 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
     fun onMediaProjectionResult(resultCode: Int, data: Intent?) {
         _uiState.update { it.copy(requiresMediaProjectionConsent = false) }
         if (resultCode == Activity.RESULT_OK && data != null && mediaProjectionManager != null) {
-            AudioRelayService.start(getApplication())
-            val projection = mediaProjectionManager.getMediaProjection(resultCode, data)
-            audioStreamManager.mediaProjection = projection
-            showStatusNotification("Audio Relay ready - Streams YouTube, music & game audio")
+            try {
+                AudioRelayService.start(getApplication())
+                val projection = mediaProjectionManager.getMediaProjection(resultCode, data)
+                audioStreamManager.mediaProjection = projection
+                showStatusNotification("Audio Relay ready - Streams YouTube, music & game audio")
+            } catch (e: Exception) {
+                Log.e(TAG, "MediaProjection initialization failed: ${e.message}")
+                _uiState.update { it.copy(audioSourceMode = AudioSourceMode.MICROPHONE) }
+                showStatusNotification("Audio capture unavailable on this device")
+            }
         } else {
             _uiState.update { it.copy(audioSourceMode = AudioSourceMode.MICROPHONE) }
             showStatusNotification("Audio capture permission denied")
@@ -377,25 +388,36 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
             return
         }
 
-        _uiState.update { it.copy(isTransmitting = true) }
+        try {
+            if (_uiState.value.audioSourceMode == AudioSourceMode.MICROPHONE) {
+                audioStreamManager.playPttStartChirp()
+            }
 
-        if (isConnected && !isLoopback) {
-            audioService.sendPttStart()
+            val started = audioStreamManager.startRecording(
+                sourceMode = _uiState.value.audioSourceMode,
+                loopbackMode = isLoopback
+            )
+
+            if (started) {
+                _uiState.update { it.copy(isTransmitting = true) }
+                if (isConnected && !isLoopback) {
+                    audioService.sendPttStart()
+                }
+            } else {
+                showStatusNotification("Microphone busy or unavailable")
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "startTransmitting failed: ${t.message}")
+            showStatusNotification("Could not start audio: ${t.message}")
+            _uiState.update { it.copy(isTransmitting = false) }
         }
-
-        if (_uiState.value.audioSourceMode == AudioSourceMode.MICROPHONE) {
-            audioStreamManager.playPttStartChirp()
-        }
-
-        audioStreamManager.startRecording(
-            sourceMode = _uiState.value.audioSourceMode,
-            loopbackMode = isLoopback
-        )
     }
 
     private fun stopTransmitting() {
         _uiState.update { it.copy(isTransmitting = false, txAudioLevel = 0f) }
-        audioStreamManager.stopRecording()
+        try {
+            audioStreamManager.stopRecording()
+        } catch (ignored: Exception) {}
 
         val isConnected = _uiState.value.connectionState is ConnectionState.Connected
         val isLoopback = _uiState.value.isLoopbackTestActive

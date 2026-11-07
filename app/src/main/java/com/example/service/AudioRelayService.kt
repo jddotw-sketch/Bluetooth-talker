@@ -10,6 +10,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.example.MainActivity
 
@@ -17,27 +18,36 @@ class AudioRelayService : Service {
     constructor() : super()
 
     companion object {
+        private const val TAG = "AudioRelayService"
         const val CHANNEL_ID = "audio_relay_channel"
         const val NOTIFICATION_ID = 101
         const val ACTION_START = "ACTION_START_AUDIO_RELAY"
         const val ACTION_STOP = "ACTION_STOP_AUDIO_RELAY"
 
         fun start(context: Context) {
-            val intent = Intent(context, AudioRelayService::class.java).apply {
-                action = ACTION_START
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
+            try {
+                val intent = Intent(context, AudioRelayService::class.java).apply {
+                    action = ACTION_START
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(intent)
+                } else {
+                    context.startService(intent)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to start AudioRelayService: ${e.message}")
             }
         }
 
         fun stop(context: Context) {
-            val intent = Intent(context, AudioRelayService::class.java).apply {
-                action = ACTION_STOP
+            try {
+                val intent = Intent(context, AudioRelayService::class.java).apply {
+                    action = ACTION_STOP
+                }
+                context.startService(intent)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to stop AudioRelayService: ${e.message}")
             }
-            context.startService(intent)
         }
     }
 
@@ -51,7 +61,9 @@ class AudioRelayService : Service {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> {
-                stopForeground(STOP_FOREGROUND_REMOVE)
+                try {
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                } catch (ignored: Exception) {}
                 stopSelf()
             }
             else -> {
@@ -62,44 +74,57 @@ class AudioRelayService : Service {
     }
 
     private fun startInForeground() {
-        val pendingIntent = PendingIntent.getActivity(
-            this,
-            0,
-            Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
-
-        val notification: Notification = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("BlueVoice Audio Relay")
-            .setContentText("Streaming device and app audio over Bluetooth")
-            .setSmallIcon(android.R.drawable.ic_media_play)
-            .setContentIntent(pendingIntent)
-            .setOngoing(true)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-            .build()
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+        try {
+            val pendingIntent = PendingIntent.getActivity(
+                this,
+                0,
+                Intent(this, MainActivity::class.java),
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
             )
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
+
+            val notification: Notification = NotificationCompat.Builder(this, CHANNEL_ID)
+                .setContentTitle("BlueVoice Audio Relay")
+                .setContentText("Streaming device and app audio over Bluetooth")
+                .setSmallIcon(android.R.drawable.ic_media_play)
+                .setContentIntent(pendingIntent)
+                .setOngoing(true)
+                .setPriority(NotificationCompat.PRIORITY_LOW)
+                .build()
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                try {
+                    startForeground(
+                        NOTIFICATION_ID,
+                        notification,
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                    )
+                } catch (se: SecurityException) {
+                    Log.w(TAG, "startForeground with mediaProjection failed, starting standard: ${se.message}")
+                    startForeground(NOTIFICATION_ID, notification)
+                }
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "startInForeground failed: ${e.message}")
         }
     }
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_ID,
-                "Audio Relay Service",
-                NotificationManager.IMPORTANCE_LOW
-            ).apply {
-                description = "Shows status while streaming system/app audio to peer device"
+            try {
+                val channel = NotificationChannel(
+                    CHANNEL_ID,
+                    "Audio Relay Service",
+                    NotificationManager.IMPORTANCE_LOW
+                ).apply {
+                    description = "Shows status while streaming system/app audio to peer device"
+                }
+                val manager = getSystemService(NotificationManager::class.java)
+                manager?.createNotificationChannel(channel)
+            } catch (e: Exception) {
+                Log.e(TAG, "createNotificationChannel failed: ${e.message}")
             }
-            val manager = getSystemService(NotificationManager::class.java)
-            manager.createNotificationChannel(channel)
         }
     }
 }

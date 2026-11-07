@@ -18,4 +18,19 @@ class ExampleRobolectricTest {
     val appName = context.getString(R.string.app_name)
     assertEquals("BlueVoice", appName)
   }
+
+  @Test
+  fun `test startRecording does not crash`() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val manager = com.example.audio.AudioStreamManager(
+        context = context,
+        onAudioPacketReady = {},
+        onAmplitudeChanged = { _, _ -> },
+        onHeadsetStateChanged = {},
+        onSampleRateChanged = {}
+    )
+    manager.startRecording(com.example.model.AudioSourceMode.MICROPHONE, false)
+    manager.stopRecording()
+    manager.release()
+  }
 }

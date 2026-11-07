@@ -54,8 +54,8 @@ class AudioStreamManager(
     private var audioRecord: AudioRecord? = null
     private var audioTrack: AudioTrack? = null
 
-    // Generous playback queue (300 chunks) to completely prevent audio dropping during small BT jitter
-    private val playbackQueue = LinkedBlockingQueue<ByteArray>(300)
+    // Low-latency playback queue (capacity 20 = ~400ms hard ceiling to prevent audio delay drift)
+    private val playbackQueue = LinkedBlockingQueue<ByteArray>(20)
     private var playbackJob: Job? = null
 
     private var recordingJob: Job? = null
@@ -158,7 +158,7 @@ class AudioStreamManager(
                 AudioFormat.ENCODING_PCM_16BIT
             )
             val validMinBuf = if (minBufSize > 0) minBufSize else 4096
-            val bufferSize = maxOf(validMinBuf * 4, 16384)
+            val bufferSize = maxOf(validMinBuf * 2, 4096)
 
             val audioAttributes = AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_MEDIA)
@@ -383,8 +383,11 @@ class AudioStreamManager(
 
     fun playIncomingAudio(data: ByteArray) {
         if (data.isEmpty()) return
-        // Keep smooth playback buffer: only discard if buffer is completely saturated (>290)
-        if (playbackQueue.remainingCapacity() < 2) {
+        // Real-Time Catch-Up Jitter Buffer:
+        // Ideal buffer depth is 2-4 packets (~40-80ms).
+        // If queue exceeds 4 packets (~80ms), drop older packets immediately to guarantee
+        // that latency NEVER drifts or accumulates over minutes of streaming!
+        while (playbackQueue.size >= 4) {
             playbackQueue.poll()
         }
         playbackQueue.offer(data)
@@ -395,6 +398,10 @@ class AudioStreamManager(
             lastRxAmplitudeTime = now
             calculateAmplitude(data, data.size, isTx = false)
         }
+    }
+
+    fun clearPlaybackQueue() {
+        playbackQueue.clear()
     }
 
     private fun applyGainAndCalculateAmplitude(buffer: ByteArray, length: Int, isTx: Boolean): ByteArray {

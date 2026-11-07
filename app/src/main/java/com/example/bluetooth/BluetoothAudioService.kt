@@ -49,6 +49,7 @@ class BluetoothAudioService(
         const val TYPE_PTT_END: Byte = 0x03
         const val TYPE_PING: Byte = 0x04
         const val TYPE_TEXT: Byte = 0x05
+        const val TYPE_AUDIO_ADPCM: Byte = 0x06 // IMA-ADPCM 4:1 compressed ultra-low-latency audio
         const val TYPE_CONFIG: Byte = 0x07 // Transmits sample rate & audio config
     }
 
@@ -288,7 +289,17 @@ class BluetoothAudioService(
     }
 
     fun sendAudio(data: ByteArray) {
-        connectedWorker?.queuePacket(TYPE_AUDIO, data)
+        if (connectedWorker == null || data.isEmpty()) return
+        try {
+            val compressed = com.example.audio.AdpcmCodec.encode(data)
+            connectedWorker?.queuePacket(TYPE_AUDIO_ADPCM, compressed)
+        } catch (e: Exception) {
+            connectedWorker?.queuePacket(TYPE_AUDIO, data)
+        }
+    }
+
+    fun clearAudioQueue() {
+        connectedWorker?.clearAudioQueue()
     }
 
     fun sendPttStart() {
@@ -312,11 +323,11 @@ class BluetoothAudioService(
     private inner class ConnectedWorker(private val socket: BluetoothSocket) {
         @Volatile
         private var isRunning = true
-        private val inStream = DataInputStream(BufferedInputStream(socket.inputStream, 32768))
-        private val outStream = DataOutputStream(BufferedOutputStream(socket.outputStream, 32768))
+        private val inStream = DataInputStream(BufferedInputStream(socket.inputStream, 16384))
+        private val outStream = DataOutputStream(BufferedOutputStream(socket.outputStream, 16384))
 
-        // Generous FIFO queue capacity (300 packets = ~6 seconds of buffer to absorb Bluetooth bursts)
-        private val sendQueue = LinkedBlockingQueue<Pair<Byte, ByteArray>>(300)
+        // Low-latency FIFO queue (capacity 15 packets = ~300ms ceiling to prevent bufferbloat)
+        private val sendQueue = LinkedBlockingQueue<Pair<Byte, ByteArray>>(15)
 
         private var readJob: Job? = null
         private var writeJob: Job? = null
@@ -404,11 +415,25 @@ class BluetoothAudioService(
 
         fun queuePacket(type: Byte, payload: ByteArray) {
             if (!isRunning) return
-            // If queue reaches critical max capacity, drop oldest packet to maintain realtime
-            if (sendQueue.remainingCapacity() < 5 && type == TYPE_AUDIO) {
-                sendQueue.poll()
+            // Real-time zero-lag enforcement:
+            // Never let audio buffer behind. If more than 3 audio packets (~60ms) are pending,
+            // drop older packets so the transmitted stream is always strictly real-time!
+            if (type == TYPE_AUDIO || type == TYPE_AUDIO_ADPCM) {
+                while (sendQueue.size >= 4) {
+                    sendQueue.poll()
+                }
             }
             sendQueue.offer(Pair(type, payload))
+        }
+
+        fun clearAudioQueue() {
+            val iterator = sendQueue.iterator()
+            while (iterator.hasNext()) {
+                val item = iterator.next()
+                if (item.first == TYPE_AUDIO || item.first == TYPE_AUDIO_ADPCM) {
+                    iterator.remove()
+                }
+            }
         }
 
         private fun onDisconnectOccurred() {

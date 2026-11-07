@@ -389,6 +389,9 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
         }
 
         try {
+            audioService.clearAudioQueue()
+            audioStreamManager.clearPlaybackQueue()
+
             if (_uiState.value.audioSourceMode == AudioSourceMode.MICROPHONE) {
                 audioStreamManager.playPttStartChirp()
             }
@@ -418,6 +421,7 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
         try {
             audioStreamManager.stopRecording()
         } catch (ignored: Exception) {}
+        audioService.clearAudioQueue()
 
         val isConnected = _uiState.value.connectionState is ConnectionState.Connected
         val isLoopback = _uiState.value.isLoopbackTestActive
@@ -507,12 +511,23 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
 
     private fun handleIncomingPacket(type: Byte, payload: ByteArray) {
         when (type) {
+            BluetoothAudioService.TYPE_AUDIO_ADPCM -> {
+                val pcm = try {
+                    com.example.audio.AdpcmCodec.decode(payload)
+                } catch (e: Exception) {
+                    payload
+                }
+                audioStreamManager.playIncomingAudio(pcm)
+                _uiState.update { it.copy(isReceivingAudio = true) }
+                resetRxAudioTimeout()
+            }
             BluetoothAudioService.TYPE_AUDIO -> {
                 audioStreamManager.playIncomingAudio(payload)
                 _uiState.update { it.copy(isReceivingAudio = true) }
                 resetRxAudioTimeout()
             }
             BluetoothAudioService.TYPE_PTT_START -> {
+                audioStreamManager.clearPlaybackQueue() // Reset delay on new transmission
                 audioStreamManager.playPttStartChirp()
                 _uiState.update { it.copy(isReceivingAudio = true) }
             }

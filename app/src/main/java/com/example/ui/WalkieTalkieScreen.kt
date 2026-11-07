@@ -692,7 +692,7 @@ fun RadioHudCard(
                     )
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
-                        text = if (audioQuality == AudioQuality.HI_FI_44K) "HI-FI 44.1 kHz • LDAC QUALITY" else "16 kHz VOICE",
+                        text = if (audioQuality == AudioQuality.HI_FI_44K) "HI-FI 44.1 kHz • ZERO-LAG SYNC" else "16 kHz VOICE • ZERO-LAG",
                         color = if (audioQuality == AudioQuality.HI_FI_44K) CyanNeon else TextSecondary,
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Bold,

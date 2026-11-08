@@ -162,6 +162,7 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
                         showStatusNotification("Connected to ${connState.deviceName} (Hi-Fi Link Ready)")
                     }
                     is ConnectionState.Disconnected -> {
+                        audioStreamManager.resetRemoteSampleRate()
                         if (_uiState.value.isTransmitting && !_uiState.value.isLoopbackTestActive) {
                             stopTransmitting()
                         }
@@ -283,6 +284,7 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
             stopTransmitting()
         }
         audioService.disconnect()
+        audioStreamManager.resetRemoteSampleRate()
         showStatusNotification("Disconnected")
     }
 
@@ -396,6 +398,12 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
                 audioStreamManager.playPttStartChirp()
             }
 
+            // PTT must precede PCM frames, including when the audio capture coroutine
+            // starts immediately on a fast device. Preserve the peer's receive queue.
+            if (isConnected && !isLoopback) {
+                audioService.sendPttStart()
+            }
+
             val started = audioStreamManager.startRecording(
                 sourceMode = _uiState.value.audioSourceMode,
                 loopbackMode = isLoopback
@@ -403,10 +411,8 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
 
             if (started) {
                 _uiState.update { it.copy(isTransmitting = true) }
-                if (isConnected && !isLoopback) {
-                    audioService.sendPttStart()
-                }
             } else {
+                if (isConnected && !isLoopback) audioService.sendPttEnd()
                 showStatusNotification("Microphone busy or unavailable")
             }
         } catch (t: Throwable) {
@@ -421,7 +427,8 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
         try {
             audioStreamManager.stopRecording()
         } catch (ignored: Exception) {}
-        audioService.clearAudioQueue()
+        // Retain queued final audio frames. Removing them here cuts off the end of words.
+        // The next PTT start explicitly clears any stale backlog instead.
 
         val isConnected = _uiState.value.connectionState is ConnectionState.Connected
         val isLoopback = _uiState.value.isLoopbackTestActive
@@ -540,8 +547,8 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
                     val sampleRate = ByteBuffer.wrap(payload).int
                     audioStreamManager.setRemoteSampleRate(sampleRate)
                     val quality = if (sampleRate >= 32000) AudioQuality.HI_FI_44K else AudioQuality.STANDARD_16K
-                    _uiState.update { it.copy(audioQuality = quality) }
-                    showStatusNotification("Remote configured: ${quality.label}")
+                    // Peer playback format does not change our local recording preference.
+                    showStatusNotification("Receiving audio: ${sampleRate} Hz (${quality.label})")
                 }
             }
             BluetoothAudioService.TYPE_TEXT -> {

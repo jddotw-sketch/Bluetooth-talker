@@ -198,7 +198,11 @@ class AudioStreamManager(
                     // When queue has drained empty, wait for pre-buffer to fill
                     // so AudioTrack is never starved on the first or jittered packet
                     if (playbackQueue.isEmpty()) {
-                        while (isActive && playbackQueue.size < preBufferThreshold) {
+                        // A short PTT burst or a beep may contain fewer than three packets.
+                        // Never leave it waiting indefinitely for packets that will not arrive.
+                        val preBufferDeadline = System.currentTimeMillis() + 60L
+                        while (isActive && playbackQueue.size < preBufferThreshold &&
+                            System.currentTimeMillis() < preBufferDeadline) {
                             delay(6)
                         }
                     }

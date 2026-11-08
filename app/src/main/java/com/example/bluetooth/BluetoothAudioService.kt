@@ -330,7 +330,7 @@ class BluetoothAudioService(
         private val outStream = DataOutputStream(BufferedOutputStream(socket.outputStream, 16384))
 
         // Buffer capacity 30 packets (~600ms headroom to smoothly absorb RFCOMM jitter without dropping frames)
-        private val sendQueue = LinkedBlockingQueue<Pair<Byte, ByteArray>>(30)
+        private val sendQueue = OutgoingPacketQueue(30, 15) { it == TYPE_AUDIO || it == TYPE_AUDIO_ADPCM }
 
         private var readJob: Job? = null
         private var writeJob: Job? = null
@@ -420,22 +420,13 @@ class BluetoothAudioService(
             if (!isRunning) return
             // Soft ceiling to prevent bufferbloat while allowing natural Bluetooth bursts:
             // Only prune if queue backs up beyond 15 packets (~300ms)
-            if (type == TYPE_AUDIO || type == TYPE_AUDIO_ADPCM) {
-                while (sendQueue.size >= 15) {
-                    sendQueue.poll()
-                }
+            if (!sendQueue.offer(type, payload)) {
+                Log.w(TAG, "Bluetooth queue full of control packets; dropped packet type=$type")
             }
-            sendQueue.offer(Pair(type, payload))
         }
 
         fun clearAudioQueue() {
-            val iterator = sendQueue.iterator()
-            while (iterator.hasNext()) {
-                val item = iterator.next()
-                if (item.first == TYPE_AUDIO || item.first == TYPE_AUDIO_ADPCM) {
-                    iterator.remove()
-                }
-            }
+            sendQueue.clearAudio()
         }
 
         private fun onDisconnectOccurred() {

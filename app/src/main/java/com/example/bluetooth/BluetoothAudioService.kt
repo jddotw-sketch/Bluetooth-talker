@@ -288,10 +288,12 @@ class BluetoothAudioService(
         connectedWorker = null
     }
 
+    private val encoderState = com.example.audio.AdpcmCodec.CodecState()
+
     fun sendAudio(data: ByteArray) {
         if (connectedWorker == null || data.isEmpty()) return
         try {
-            val compressed = com.example.audio.AdpcmCodec.encode(data)
+            val compressed = com.example.audio.AdpcmCodec.encode(data, encoderState)
             connectedWorker?.queuePacket(TYPE_AUDIO_ADPCM, compressed)
         } catch (e: Exception) {
             connectedWorker?.queuePacket(TYPE_AUDIO, data)
@@ -299,6 +301,7 @@ class BluetoothAudioService(
     }
 
     fun clearAudioQueue() {
+        encoderState.reset()
         connectedWorker?.clearAudioQueue()
     }
 
@@ -326,8 +329,8 @@ class BluetoothAudioService(
         private val inStream = DataInputStream(BufferedInputStream(socket.inputStream, 16384))
         private val outStream = DataOutputStream(BufferedOutputStream(socket.outputStream, 16384))
 
-        // Low-latency FIFO queue (capacity 15 packets = ~300ms ceiling to prevent bufferbloat)
-        private val sendQueue = LinkedBlockingQueue<Pair<Byte, ByteArray>>(15)
+        // Buffer capacity 30 packets (~600ms headroom to smoothly absorb RFCOMM jitter without dropping frames)
+        private val sendQueue = LinkedBlockingQueue<Pair<Byte, ByteArray>>(30)
 
         private var readJob: Job? = null
         private var writeJob: Job? = null
@@ -415,11 +418,10 @@ class BluetoothAudioService(
 
         fun queuePacket(type: Byte, payload: ByteArray) {
             if (!isRunning) return
-            // Real-time zero-lag enforcement:
-            // Never let audio buffer behind. If more than 3 audio packets (~60ms) are pending,
-            // drop older packets so the transmitted stream is always strictly real-time!
+            // Soft ceiling to prevent bufferbloat while allowing natural Bluetooth bursts:
+            // Only prune if queue backs up beyond 15 packets (~300ms)
             if (type == TYPE_AUDIO || type == TYPE_AUDIO_ADPCM) {
-                while (sendQueue.size >= 4) {
+                while (sendQueue.size >= 15) {
                     sendQueue.poll()
                 }
             }

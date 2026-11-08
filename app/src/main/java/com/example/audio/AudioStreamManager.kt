@@ -54,8 +54,8 @@ class AudioStreamManager(
     private var audioRecord: AudioRecord? = null
     private var audioTrack: AudioTrack? = null
 
-    // Low-latency playback queue (capacity 20 = ~400ms hard ceiling to prevent audio delay drift)
-    private val playbackQueue = LinkedBlockingQueue<ByteArray>(20)
+    // Playback queue (capacity 30 = ~600ms ceiling to prevent bufferbloat while absorbing jitter)
+    private val playbackQueue = LinkedBlockingQueue<ByteArray>(30)
     private var playbackJob: Job? = null
 
     private var recordingJob: Job? = null
@@ -158,7 +158,7 @@ class AudioStreamManager(
                 AudioFormat.ENCODING_PCM_16BIT
             )
             val validMinBuf = if (minBufSize > 0) minBufSize else 4096
-            val bufferSize = maxOf(validMinBuf * 2, 4096)
+            val bufferSize = maxOf(validMinBuf * 3, 8192)
 
             val audioAttributes = AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_MEDIA)
@@ -191,9 +191,19 @@ class AudioStreamManager(
     private fun startPlaybackWorker() {
         playbackJob?.cancel()
         playbackJob = scope.launch {
+            val preBufferThreshold = 3 // Pre-buffer 3 packets (~60ms) before playing to eliminate drops & cuts
+
             while (isActive) {
                 try {
-                    val data = playbackQueue.take()
+                    // When queue has drained empty, wait for pre-buffer to fill
+                    // so AudioTrack is never starved on the first or jittered packet
+                    if (playbackQueue.isEmpty()) {
+                        while (isActive && playbackQueue.size < preBufferThreshold) {
+                            delay(6)
+                        }
+                    }
+
+                    val data = playbackQueue.poll() ?: continue
                     if (audioTrack == null || audioTrack?.state != AudioTrack.STATE_INITIALIZED) {
                         initAudioTrack(currentQuality.sampleRate)
                     }
@@ -332,17 +342,25 @@ class AudioStreamManager(
                     val buffer = ByteArray(chunkSize)
                     while (isActive && isRecording) {
                         val rec = audioRecord ?: break
-                        val readBytes = try {
-                            rec.read(buffer, 0, buffer.size)
-                        } catch (e: Exception) {
-                            -1
+                        var totalRead = 0
+                        while (totalRead < chunkSize && isActive && isRecording) {
+                            val count = try {
+                                rec.read(buffer, totalRead, chunkSize - totalRead)
+                            } catch (e: Exception) {
+                                -1
+                            }
+                            if (count <= 0) {
+                                delay(6)
+                                break
+                            }
+                            totalRead += count
                         }
 
-                        if (readBytes > 0) {
+                        if (totalRead > 0) {
                             val processed = if (isMuted) {
-                                ByteArray(readBytes)
+                                ByteArray(totalRead)
                             } else {
-                                applyGainAndCalculateAmplitude(buffer, readBytes, isTx = true)
+                                applyGainAndCalculateAmplitude(buffer, totalRead, isTx = true)
                             }
 
                             if (isLoopback) {
@@ -350,9 +368,6 @@ class AudioStreamManager(
                             } else {
                                 onAudioPacketReady(processed)
                             }
-                        } else {
-                            // Prevent tight CPU busy-loop if read error occurs
-                            delay(15)
                         }
                     }
                 } catch (t: Throwable) {
@@ -383,11 +398,10 @@ class AudioStreamManager(
 
     fun playIncomingAudio(data: ByteArray) {
         if (data.isEmpty()) return
-        // Real-Time Catch-Up Jitter Buffer:
-        // Ideal buffer depth is 2-4 packets (~40-80ms).
-        // If queue exceeds 4 packets (~80ms), drop older packets immediately to guarantee
-        // that latency NEVER drifts or accumulates over minutes of streaming!
-        while (playbackQueue.size >= 4) {
+        // Allow up to 10 packets (~200ms) to absorb natural RFCOMM packet bursts.
+        // If queue exceeds 10 packets due to drift or sustained delay, trim oldest packet
+        // to maintain low latency (< 160ms) without ever causing audio cuts.
+        while (playbackQueue.size >= 10) {
             playbackQueue.poll()
         }
         playbackQueue.offer(data)

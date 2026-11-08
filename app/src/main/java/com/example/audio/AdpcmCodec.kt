@@ -18,10 +18,20 @@ import java.nio.ByteOrder
  * - 1 byte: reserved (0x00)
  * Followed by packed nibbles.
  *
- * Packets are self-contained so that any dropped or skipped packet over Bluetooth
- * immediately resets the decoder without audio drift or glitches.
+ * Continuous state tracking eliminates 50Hz step-size reset artifacts,
+ * while self-contained headers allow dropped packets to recover instantly.
  */
 object AdpcmCodec {
+
+    class CodecState(
+        var predictor: Int = 0,
+        var index: Int = 0
+    ) {
+        fun reset() {
+            predictor = 0
+            index = 0
+        }
+    }
 
     private val INDEX_TABLE = intArrayOf(
         -1, -1, -1, -1, 2, 4, 6, 8,
@@ -40,7 +50,7 @@ object AdpcmCodec {
         15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767
     )
 
-    fun encode(pcmData: ByteArray): ByteArray {
+    fun encode(pcmData: ByteArray, state: CodecState? = null): ByteArray {
         val numSamples = pcmData.size / 2
         if (numSamples == 0) return ByteArray(0)
 
@@ -54,8 +64,12 @@ object AdpcmCodec {
         val encodedLength = 4 + (numSamples + 1) / 2
         val out = ByteArray(encodedLength)
 
-        var predictedSample = samples[0].toInt()
-        var index = 0
+        var predictedSample = if (state != null && (state.predictor != 0 || state.index != 0)) {
+            state.predictor
+        } else {
+            samples[0].toInt()
+        }
+        var index = state?.index?.coerceIn(0, 88) ?: 0
 
         // Header
         out[0] = (predictedSample and 0xFF).toByte()
@@ -122,6 +136,9 @@ object AdpcmCodec {
         if (bufferStep == 1 && outPos < out.size) {
             out[outPos] = tempByte.toByte()
         }
+
+        state?.predictor = predictedSample
+        state?.index = index
 
         return out
     }

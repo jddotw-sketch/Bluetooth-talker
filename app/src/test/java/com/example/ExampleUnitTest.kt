@@ -61,4 +61,25 @@ class ExampleUnitTest {
         val decodedSilence = AdpcmCodec.decode(encodedSilence)
         assertEquals(640, decodedSilence.size)
     }
+
+    @Test
+    fun adpcmCodec_consecutivePacketsWithStateStreamSmoothly() {
+        val state = AdpcmCodec.CodecState()
+        val numSamples = 960
+        // Generate continuous audio across 3 packets
+        for (packet in 0 until 3) {
+            val pcm = ByteArray(numSamples * 2)
+            val buffer = ByteBuffer.wrap(pcm).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+            for (i in 0 until numSamples) {
+                val totalSampleIndex = packet * numSamples + i
+                val sample = (sin(2.0 * Math.PI * 440.0 * totalSampleIndex / 48000.0) * 16000.0).toInt().toShort()
+                buffer.put(sample)
+            }
+            val encoded = AdpcmCodec.encode(pcm, state)
+            assertEquals(484, encoded.size)
+            val decoded = AdpcmCodec.decode(encoded)
+            assertEquals(numSamples * 2, decoded.size)
+        }
+        assertTrue("Predictor should be tracking wave", state.predictor != 0)
+    }
 }

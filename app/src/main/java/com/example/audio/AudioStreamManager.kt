@@ -73,6 +73,18 @@ class AudioStreamManager(
     var isMuted: Boolean = false
     var rogerBeepEnabled: Boolean = true
 
+    /** Play remote speech on the media stream without requesting exclusive audio focus. */
+    @Volatile
+    var mixWithOtherAudio: Boolean = true
+        private set
+
+    fun setMixWithOtherAudio(enabled: Boolean) {
+        if (mixWithOtherAudio == enabled) return
+        mixWithOtherAudio = enabled
+        // AudioAttributes are immutable, so create a new track at the same sample rate.
+        initAudioTrack(playbackSampleRate, force = true)
+    }
+
     // MediaProjection instance for Audio Relay (capturing all app/system audio)
     var mediaProjection: MediaProjection? = null
 
@@ -162,8 +174,8 @@ class AudioStreamManager(
     }
 
     @Synchronized
-    private fun initAudioTrack(sampleRate: Int) {
-        if (playbackSampleRate == sampleRate && audioTrack?.state == AudioTrack.STATE_INITIALIZED) return
+    private fun initAudioTrack(sampleRate: Int, force: Boolean = false) {
+        if (!force && playbackSampleRate == sampleRate && audioTrack?.state == AudioTrack.STATE_INITIALIZED) return
         try {
             val minBufSize = AudioTrack.getMinBufferSize(
                 sampleRate,
@@ -177,7 +189,7 @@ class AudioStreamManager(
             val bufferSize = maxOf(minBufSize * 3, 8192)
             val audioAttributes = AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_MEDIA)
-                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                .setContentType(if (mixWithOtherAudio) AudioAttributes.CONTENT_TYPE_SPEECH else AudioAttributes.CONTENT_TYPE_MUSIC)
                 .build()
             val audioFormat = AudioFormat.Builder()
                 .setEncoding(AudioFormat.ENCODING_PCM_16BIT)

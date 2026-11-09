@@ -390,12 +390,14 @@ fun WalkieTalkieScreen(
                 AudioSettingsSheet(
                     audioQuality = uiState.audioQuality,
                     audioRoute = uiState.audioRoute,
+                    mixWithOtherAudio = uiState.mixWithOtherAudio,
                     isHeadsetPlugged = uiState.isHeadsetPlugged,
                     autoConnectEnabled = uiState.autoConnectEnabled,
                     lastConnectedName = uiState.lastConnectedDeviceName,
                     lastConnectedAddr = uiState.lastConnectedDeviceAddress,
                     onSetQuality = { viewModel.setAudioQuality(it) },
                     onSetRoute = { viewModel.setAudioRoute(it) },
+                    onToggleMixWithOtherAudio = { viewModel.toggleMixWithOtherAudio() },
                     onToggleAutoConnect = { viewModel.toggleAutoConnect() },
                     onConnectLastDevice = {
                         val addr = uiState.lastConnectedDeviceAddress

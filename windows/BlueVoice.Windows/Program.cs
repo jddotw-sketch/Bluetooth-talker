@@ -90,7 +90,7 @@ internal sealed class MainWindow : Form
                 }));
             };
             sender.Start();
-            status.Text = $"Streaming PC sound to Android on {port} at {rate} Hz. Other PC apps continue playing normally.";
+            status.Text = $"Streaming ADPCM audio to Android on {port} at {rate} Hz. Other PC apps continue playing normally.";
             start.Enabled = false; stop.Enabled = true; ports.Enabled = false; qualities.Enabled = false;
         } catch (Exception ex) {
             sender?.Dispose(); sender = null;
@@ -108,8 +108,9 @@ internal sealed class MainWindow : Form
 
 internal sealed class LoopbackSender : IDisposable
 {
-    private const byte Magic = 0x5A, Audio = 0x01, StartPtt = 0x02, EndPtt = 0x03, Config = 0x07;
+    private const byte Magic = 0x5A, AudioAdpcm = 0x06, StartPtt = 0x02, EndPtt = 0x03, Config = 0x07;
     private readonly SerialPort serial;
+    private readonly AdpcmEncoder encoder = new();
     private readonly WasapiLoopbackCapture capture;
     private readonly Channel<byte[]> frames;
     private readonly CancellationTokenSource cancel = new();
@@ -153,7 +154,7 @@ internal sealed class LoopbackSender : IDisposable
         writer = Task.Run(async () => {
             try {
                 await foreach (var frame in frames.Reader.ReadAllAsync(cancel.Token)) {
-                    WritePacket(Audio, frame);
+                    WritePacket(AudioAdpcm, encoder.Encode(frame));
                 }
             } catch (OperationCanceledException) { }
               catch (Exception ex) {

@@ -59,6 +59,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -346,6 +347,38 @@ fun WalkieTalkieScreen(
                     onStartListening = { viewModel.startListening() },
                     onDisconnect = { viewModel.disconnect() }
                 )
+
+                if (uiState.connectedPeers.isNotEmpty()) {
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Text(
+                        text = "ACTIVE SOURCES (${uiState.connectedPeers.size}/2)",
+                        color = CyanNeon,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    uiState.connectedPeers.forEach { peer ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(peer.name, color = TextPrimary, fontSize = 13.sp)
+                            TextButton(onClick = { viewModel.disconnectPeer(peer.address) }) {
+                                Text("Disconnect", color = RedMuted)
+                            }
+                        }
+                    }
+                }
+                Button(
+                    onClick = {
+                        viewModel.startListening()
+                        viewModel.setDeviceDialogVisible(true)
+                    },
+                    modifier = Modifier.fillMaxWidth().testTag("dual_source_listen_button"),
+                    colors = ButtonDefaults.buttonColors(containerColor = BlueAccent)
+                ) {
+                    Text("Receive phone + Windows audio (2 sources)")
+                }
 
                 Spacer(modifier = Modifier.height(24.dp))
             }

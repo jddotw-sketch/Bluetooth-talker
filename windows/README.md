@@ -18,7 +18,7 @@ The Android receiver accepts two simultaneous **RFCOMM/SPP** application streams
 4. Pair your Windows PC and Android receiver via Windows **Settings > Bluetooth & devices**.
 5. In the legacy Bluetooth settings, check **COM Ports** for an outgoing serial port associated with the receiver's RFCOMM service. Use that port in the app. If no outgoing SPP port is available, the current Windows transport cannot connect; some Windows Bluetooth adapters/drivers do not expose it.
 
-The app captures your current default Windows output audio via WASAPI loopback (other apps remain audible on the PC). It converts this to 16 kHz mono by default, or 44.1 kHz mono for higher fidelity. It sends 20-ms PCM packets using BlueVoice's protocol. If streaming is choppy, select 16 kHz.
+The app captures your current default Windows output audio via WASAPI loopback (other apps remain audible on the PC). It converts this to 16 kHz mono by default, or 44.1 kHz mono for higher fidelity. It compresses each 20-ms frame with IMA ADPCM (roughly 4:1) before sending, to reduce SPP bandwidth and improve throughput. If streaming is choppy, select 16 kHz.
 
 ## Limitations
 
@@ -31,4 +31,4 @@ The app captures your current default Windows output audio via WASAPI loopback (
 
 ## Protocol
 
-Each RFCOMM frame starts with `0x5A`, then one type byte, a **big-endian 16-bit payload length**, and the payload. Control packets: type 2 = PTT start, type 3 = PTT end, type 7 = 4-byte big-endian sample rate. Type 1 carries signed 16-bit little-endian mono PCM; Android clients may instead send type 6 IMA ADPCM. Each connection's decoder, sample rate, queue and playback track are independent.
+Each RFCOMM frame starts with `0x5A`, then one type byte, a **big-endian 16-bit payload length**, and the payload. Control packets: type 2 = PTT start, type 3 = PTT end, type 7 = 4-byte big-endian sample rate. Type 1 carries signed 16-bit little-endian mono PCM; **type 6 carries IMA ADPCM** (the Windows and Android apps use type 6). Each connection's decoder, sample rate, queue and playback track are independent.

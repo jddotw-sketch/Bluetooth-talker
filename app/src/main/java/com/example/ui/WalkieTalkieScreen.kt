@@ -266,7 +266,6 @@ fun WalkieTalkieScreen(
                     audioSourceMode = uiState.audioSourceMode,
                     audioQuality = uiState.audioQuality,
                     audioRoute = uiState.audioRoute,
-                    mixWithOtherAudio = uiState.mixWithOtherAudio,
                     isHeadsetPlugged = uiState.isHeadsetPlugged,
                     autoConnectEnabled = uiState.autoConnectEnabled,
                     isTransmitting = uiState.isTransmitting,
@@ -391,6 +390,7 @@ fun WalkieTalkieScreen(
                 AudioSettingsSheet(
                     audioQuality = uiState.audioQuality,
                     audioRoute = uiState.audioRoute,
+                    mixWithOtherAudio = uiState.mixWithOtherAudio,
                     isHeadsetPlugged = uiState.isHeadsetPlugged,
                     autoConnectEnabled = uiState.autoConnectEnabled,
                     lastConnectedName = uiState.lastConnectedDeviceName,

@@ -83,10 +83,12 @@ internal sealed class MainWindow : Form
         try {
             var rate = qualities.SelectedIndex == 1 ? 44100 : 16000;
             sender = new LoopbackSender(port, rate);
-            sender.Stopped += error => BeginInvoke(() => {
-                status.Text = error is null ? "Audio capture stopped." : $"Stream stopped: {error.Message}";
-                StopStreaming();
-            });
+            sender.Stopped += error => {
+                if (IsHandleCreated) BeginInvoke((Action)(() => {
+                    status.Text = error is null ? "Audio capture stopped." : $"Stream stopped: {error.Message}";
+                    StopStreaming();
+                }));
+            };
             sender.Start();
             status.Text = $"Streaming PC sound to Android on {port} at {rate} Hz. Other PC apps continue playing normally.";
             start.Enabled = false; stop.Enabled = true; ports.Enabled = false; qualities.Enabled = false;

@@ -384,10 +384,12 @@ class AudioStreamManager(
                 initAudioTrack(actualRate)
             }
 
-            if (actualRate != currentQuality.sampleRate) {
-                Log.d(TAG, "Recording at hardware sample rate $actualRate Hz (requested ${currentQuality.sampleRate})")
-                onSampleRateChanged(actualRate)
-            }
+            // Always announce the *actual* capture rate for every new transmission.
+            // The remote receiver may be at another rate (for example, 16 kHz
+            // from a Windows peer), and the initial connection config may have
+            // been sent before Android selected its recording hardware format.
+            Log.d(TAG, "Recording at hardware sample rate $actualRate Hz (requested ${currentQuality.sampleRate})")
+            if (!loopbackMode) onSampleRateChanged(actualRate)
 
             try {
                 record.startRecording()

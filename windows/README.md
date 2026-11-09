@@ -18,6 +18,8 @@ The Android receiver accepts two simultaneous **RFCOMM/SPP** application streams
 4. Pair your Windows PC and Android receiver via Windows **Settings > Bluetooth & devices**.
 5. In the legacy Bluetooth settings, check **COM Ports** for an outgoing serial port associated with the receiver's RFCOMM service. Use that port in the app. If no outgoing SPP port is available, the current Windows transport cannot connect; some Windows Bluetooth adapters/drivers do not expose it.
 
+**Windows COM port baud-rate compatibility:** BlueVoice configures the virtual SPP serial port at **115200 baud**, since some Windows Bluetooth COM drivers reject higher settings (for example 921600). RFCOMM is not a physical UART, so the serial driver's baud-rate setting is not necessarily the real over-the-air throughput. If audio stalls, select **16 kHz mono** first; high-quality 44.1 kHz needs more sustained Bluetooth bandwidth.
+
 The app captures your current default Windows output audio via WASAPI loopback (other apps remain audible on the PC). It converts this to 16 kHz mono by default, or 44.1 kHz mono for higher fidelity. It compresses each 20-ms frame with IMA ADPCM (roughly 4:1) before sending, to reduce SPP bandwidth and improve throughput. If streaming is choppy, select 16 kHz.
 
 ## Limitations

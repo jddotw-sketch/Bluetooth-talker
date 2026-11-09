@@ -90,11 +90,16 @@ internal sealed class MainWindow : Form
                 }));
             };
             sender.Start();
-            status.Text = $"Streaming ADPCM audio to Android on {port} at {rate} Hz. Other PC apps continue playing normally.";
+            status.Text = $"Streaming ADPCM audio to Android on {port} at {rate} Hz. " +
+                (rate == 44100 ? "If audio stutters, select 16 kHz." : "Stable low-bandwidth mode.");
             start.Enabled = false; stop.Enabled = true; ports.Enabled = false; qualities.Enabled = false;
         } catch (Exception ex) {
             sender?.Dispose(); sender = null;
-            status.Text = $"Unable to connect: {ex.Message}";
+            status.Text = ex is UnauthorizedAccessException
+                ? $"Unable to open {port}: another app is using it. Close the other app and retry."
+                : ex is ArgumentException && ex.Message.Contains("baud", StringComparison.OrdinalIgnoreCase)
+                    ? "The Bluetooth COM driver rejected the serial baud rate. Update the Windows Bluetooth driver or try another outgoing COM port."
+                    : $"Unable to connect: {ex.Message}";
         }
     }
 
@@ -127,7 +132,10 @@ internal sealed class LoopbackSender : IDisposable
     public LoopbackSender(string port, int sampleRate)
     {
         targetRate = sampleRate;
-        serial = new SerialPort(port, 921600, Parity.None, 8, StopBits.One) {
+        // Windows Bluetooth virtual COM drivers commonly cap the configurable baud rate
+        // at 115200 even though RFCOMM data travels over Bluetooth rather than a UART.
+        // Do not request 921600: SerialPort.Open rejects it on those drivers.
+        serial = new SerialPort(port, 115200, Parity.None, 8, StopBits.One) {
             Handshake = Handshake.None,
             ReadTimeout = 1500,
             WriteTimeout = 1500

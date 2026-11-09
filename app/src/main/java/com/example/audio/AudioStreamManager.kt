@@ -329,6 +329,14 @@ class AudioStreamManager(
             }
         }
 
+        // System-audio relay must never silently switch to the microphone. If
+        // capture is denied/unavailable, send no audio and surface an error
+        // instead of broadcasting room noise while the UI says App Audio Relay.
+        if (sourceMode == AudioSourceMode.APP_AUDIO_RELAY) {
+            Log.e(TAG, "App audio relay unavailable: missing/invalid MediaProjection or AudioRecord")
+            return null
+        }
+
         // 2. Microphone capture: Test candidate rates and audio sources supported by device hardware
         // Android microphone hardware standard rates: 16000 Hz and 48000 Hz are universal
         val candidateRates = when (requestedSampleRate) {

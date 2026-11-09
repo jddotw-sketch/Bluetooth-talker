@@ -172,6 +172,17 @@ internal sealed class LoopbackSender : IDisposable
             var format = capture.WaveFormat;
             int bytesPerSample = format.BitsPerSample / 8;
             if (bytesPerSample <= 0 || format.Channels <= 0) return;
+            bool float32 = bytesPerSample == 4 && (
+                format.Encoding == WaveFormatEncoding.IeeeFloat ||
+                (format is WaveFormatExtensible f && f.SubFormat ==
+                    new Guid("00000003-0000-0010-8000-00aa00389b71")));
+            bool pcm16 = bytesPerSample == 2 && (
+                format.Encoding == WaveFormatEncoding.Pcm ||
+                (format is WaveFormatExtensible p && p.SubFormat ==
+                    new Guid("00000001-0000-0010-8000-00aa00389b71")));
+            if (!float32 && !pcm16) {
+                throw new NotSupportedException($"Unsupported Windows output format: {format}");
+            }
             int frameBytes = bytesPerSample * format.Channels;
             int frameCount = args.BytesRecorded / frameBytes;
             var buffer = args.Buffer;
@@ -183,11 +194,9 @@ internal sealed class LoopbackSender : IDisposable
                     for (int channel = 0; channel < format.Channels; channel++) {
                         int pos = frame * frameBytes + channel * bytesPerSample;
                         float value;
-                        if (format.Encoding == WaveFormatEncoding.IeeeFloat && bytesPerSample == 4)
-                            value = BitConverter.ToSingle(buffer, pos);
-                        else if (format.Encoding == WaveFormatEncoding.Pcm && bytesPerSample == 2)
-                            value = BitConverter.ToInt16(buffer, pos) / 32768f;
-                        else return;
+                        value = float32
+                            ? BitConverter.ToSingle(buffer, pos)
+                            : BitConverter.ToInt16(buffer, pos) / 32768f;
                         current += value;
                     }
                     current /= format.Channels;

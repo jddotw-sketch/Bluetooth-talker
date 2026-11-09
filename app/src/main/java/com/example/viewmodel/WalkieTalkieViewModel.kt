@@ -22,6 +22,7 @@ import com.example.model.ChatMessage
 import com.example.model.ConnectionState
 import com.example.model.WalkieMode
 import com.example.service.AudioRelayService
+import com.example.service.BluetoothSessionService
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -39,7 +40,8 @@ data class WalkieTalkieUiState(
     val walkieMode: WalkieMode = WalkieMode.PUSH_TO_TALK,
     val audioSourceMode: AudioSourceMode = AudioSourceMode.MICROPHONE, // Default to Microphone Walkie-Talkie
     val audioQuality: AudioQuality = AudioQuality.HI_FI_44K,           // Hi-Fi quality mode
-    val audioRoute: AudioRoute = AudioRoute.HEADSET_OR_AUTO,          // 3.5mm Headset / Auto
+    val audioRoute: AudioRoute = AudioRoute.HEADSET_OR_AUTO,
+    val mixWithOtherAudio: Boolean = true,          // 3.5mm Headset / Auto
     val isHeadsetPlugged: Boolean = false,
     val autoConnectEnabled: Boolean = true,
     val lastConnectedDeviceName: String? = null,
@@ -73,6 +75,7 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
         private const val KEY_LAST_NAME = "last_connected_name"
         private const val KEY_QUALITY = "audio_quality"
         private const val KEY_ROUTE = "audio_route"
+        private const val KEY_MIX_AUDIO = "mix_with_other_audio"
     }
 
     private val prefs: SharedPreferences = application.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -80,6 +83,7 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
     private val _uiState = MutableStateFlow(
         WalkieTalkieUiState(
             autoConnectEnabled = prefs.getBoolean(KEY_AUTO_CONNECT, true),
+            mixWithOtherAudio = prefs.getBoolean(KEY_MIX_AUDIO, true),
             lastConnectedDeviceAddress = prefs.getString(KEY_LAST_ADDR, null),
             lastConnectedDeviceName = prefs.getString(KEY_LAST_NAME, null),
             audioQuality = try {
@@ -135,6 +139,7 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
     )
 
     init {
+        audioStreamManager.setMixWithOtherAudio(_uiState.value.mixWithOtherAudio)
         audioStreamManager.setAudioQuality(_uiState.value.audioQuality)
         audioStreamManager.setAudioOutputRoute(_uiState.value.audioRoute)
 
@@ -146,6 +151,7 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
                 when (connState) {
                     is ConnectionState.Connected -> {
                         autoReconnectJob?.cancel()
+                        BluetoothSessionService.start(getApplication())
                         // Save last connected device for auto-connect
                         prefs.edit()
                             .putString(KEY_LAST_ADDR, connState.deviceAddress)
@@ -162,6 +168,7 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
                         showStatusNotification("Connected to ${connState.deviceName} (Hi-Fi Link Ready)")
                     }
                     is ConnectionState.Disconnected -> {
+                        BluetoothSessionService.stop(getApplication())
                         audioStreamManager.resetRemoteSampleRate()
                         if (_uiState.value.isTransmitting && !_uiState.value.isLoopbackTestActive) {
                             stopTransmitting()
@@ -221,6 +228,14 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
             audioService.sendConfig(quality.sampleRate)
         }
         showStatusNotification("Quality: ${quality.label}")
+    }
+
+    fun toggleMixWithOtherAudio() {
+        val enabled = !_uiState.value.mixWithOtherAudio
+        prefs.edit().putBoolean(KEY_MIX_AUDIO, enabled).apply()
+        _uiState.update { it.copy(mixWithOtherAudio = enabled) }
+        audioStreamManager.setMixWithOtherAudio(enabled)
+        showStatusNotification(if (enabled) "Voice over other audio enabled" else "Normal audio playback mode")
     }
 
     fun setAudioRoute(route: AudioRoute) {
@@ -284,6 +299,7 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
             stopTransmitting()
         }
         audioService.disconnect()
+        BluetoothSessionService.stop(getApplication())
         audioStreamManager.resetRemoteSampleRate()
         showStatusNotification("Disconnected")
     }
@@ -581,6 +597,7 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
         rxTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
         autoReconnectJob?.cancel()
         AudioRelayService.stop(getApplication())
+        BluetoothSessionService.stop(getApplication())
         audioStreamManager.release()
         audioService.cleanup()
     }

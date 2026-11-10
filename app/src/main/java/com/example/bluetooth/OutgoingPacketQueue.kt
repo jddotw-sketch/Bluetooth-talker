@@ -8,7 +8,7 @@ import java.util.concurrent.LinkedBlockingQueue
  * new packets instead of silently dropping an existing PTT/config/text command.
  */
 internal class OutgoingPacketQueue(
-    capacity: Int = 30,
+    private val capacity: Int = 30,
     maxAudioPackets: Int = 15,
     private val isAudio: (Byte) -> Boolean
 ) {

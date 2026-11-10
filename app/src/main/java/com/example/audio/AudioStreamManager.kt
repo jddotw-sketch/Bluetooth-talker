@@ -72,6 +72,8 @@ class AudioStreamManager(
     var micGain: Float = 1.2f
     var isMuted: Boolean = false
     var rogerBeepEnabled: Boolean = true
+    @Volatile
+    var lowLatencyEnabled: Boolean = false
 
     /** Play remote speech on the media stream without requesting exclusive audio focus. */
     @Volatile
@@ -409,7 +411,8 @@ class AudioStreamManager(
 
             isRecording = true
 
-            val chunkSize = (actualRate * 2 * 20) / 1000 // 20ms of audio
+            val packetMs = AudioLatencyProfile.capturePacketMs(actualRate, lowLatencyEnabled)
+            val chunkSize = (actualRate * 2 * packetMs) / 1000
 
             recordingJob = scope.launch {
                 try {

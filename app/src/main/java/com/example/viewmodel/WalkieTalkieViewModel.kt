@@ -43,7 +43,8 @@ data class WalkieTalkieUiState(
     val audioSourceMode: AudioSourceMode = AudioSourceMode.MICROPHONE, // Default to Microphone Walkie-Talkie
     val audioQuality: AudioQuality = AudioQuality.HI_FI_44K,           // Hi-Fi quality mode
     val audioRoute: AudioRoute = AudioRoute.HEADSET_OR_AUTO,
-    val mixWithOtherAudio: Boolean = true,          // 3.5mm Headset / Auto
+    val mixWithOtherAudio: Boolean = true,
+    val lowLatencyEnabled: Boolean = false,          // 3.5mm Headset / Auto
     val isHeadsetPlugged: Boolean = false,
     val autoConnectEnabled: Boolean = true,
     val lastConnectedDeviceName: String? = null,
@@ -78,6 +79,7 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
         private const val KEY_QUALITY = "audio_quality"
         private const val KEY_ROUTE = "audio_route"
         private const val KEY_MIX_AUDIO = "mix_with_other_audio"
+        private const val KEY_LOW_LATENCY = "low_latency_audio"
     }
 
     private val prefs: SharedPreferences = application.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -86,6 +88,7 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
         WalkieTalkieUiState(
             autoConnectEnabled = prefs.getBoolean(KEY_AUTO_CONNECT, true),
             mixWithOtherAudio = prefs.getBoolean(KEY_MIX_AUDIO, true),
+            lowLatencyEnabled = prefs.getBoolean(KEY_LOW_LATENCY, false),
             lastConnectedDeviceAddress = prefs.getString(KEY_LAST_ADDR, null),
             lastConnectedDeviceName = prefs.getString(KEY_LAST_NAME, null),
             audioQuality = try {
@@ -144,6 +147,8 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
 
     init {
         audioStreamManager.setMixWithOtherAudio(_uiState.value.mixWithOtherAudio)
+        audioStreamManager.lowLatencyEnabled = _uiState.value.lowLatencyEnabled
+        audioService.lowLatencyEnabled = _uiState.value.lowLatencyEnabled
         audioStreamManager.setAudioQuality(_uiState.value.audioQuality)
         audioStreamManager.setAudioOutputRoute(_uiState.value.audioRoute)
 
@@ -245,6 +250,16 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
             audioService.sendConfig(quality.sampleRate)
         }
         showStatusNotification("Quality: ${quality.label}")
+    }
+
+    fun toggleLowLatency() {
+        val enabled = !_uiState.value.lowLatencyEnabled
+        if (_uiState.value.isTransmitting) stopTransmitting()
+        prefs.edit().putBoolean(KEY_LOW_LATENCY, enabled).apply()
+        _uiState.update { it.copy(lowLatencyEnabled = enabled) }
+        audioStreamManager.lowLatencyEnabled = enabled
+        audioService.lowLatencyEnabled = enabled
+        showStatusNotification(if (enabled) "Low latency enabled (shorter buffers)" else "Smooth playback mode enabled")
     }
 
     fun toggleMixWithOtherAudio() {
@@ -439,6 +454,7 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
             // PTT must precede PCM frames, including when the audio capture coroutine
             // starts immediately on a fast device. Preserve the peer's receive queue.
             if (isConnected && !isLoopback) {
+                audioService.sendLatencyConfig()
                 audioService.sendPttStart()
             }
 
@@ -578,6 +594,9 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
             BluetoothAudioService.TYPE_PTT_END -> {
                 audioStreamManager.playRogerBeep()
                 _uiState.update { it.copy(isReceivingAudio = false, rxAudioLevel = 0f) }
+            }
+            BluetoothAudioService.TYPE_LATENCY_CONFIG -> {
+                if (payload.isNotEmpty()) peerAudioMixer.setLowLatency(address, payload[0].toInt() != 0)
             }
             BluetoothAudioService.TYPE_CONFIG -> {
                 if (payload.size >= 4) {

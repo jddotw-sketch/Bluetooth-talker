@@ -9,6 +9,8 @@
 
     <!-- Foreground Service permissions for Audio Relay (MediaProjection) -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission
         android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"
         tools:targetApi="upside_down_cake" />
@@ -58,6 +60,11 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <service
+            android:name=".service.BluetoothSessionService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice|mediaPlayback" />
 
         <!-- Foreground service for MediaProjection Audio Relay capture on Android 10+ / 14+ -->
         <service

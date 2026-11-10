@@ -35,10 +35,11 @@ import java.util.concurrent.LinkedBlockingQueue
 
 class BluetoothAudioService(
     private val context: Context,
-    private val onPacketReceived: (type: Byte, payload: ByteArray) -> Unit
+    private val onPacketReceived: (deviceAddress: String, type: Byte, payload: ByteArray) -> Unit
 ) {
     companion object {
         private const val TAG = "BluetoothAudioService"
+        const val MAX_CONNECTIONS = 2
         private const val SERVICE_NAME = "BlueVoiceAudio"
         val SPP_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
 
@@ -51,6 +52,7 @@ class BluetoothAudioService(
         const val TYPE_TEXT: Byte = 0x05
         const val TYPE_AUDIO_ADPCM: Byte = 0x06 // IMA-ADPCM 4:1 compressed ultra-low-latency audio
         const val TYPE_CONFIG: Byte = 0x07 // Transmits sample rate & audio config
+        const val TYPE_LATENCY_CONFIG: Byte = 0x08 // 1 byte: 0 = smooth, 1 = low latency
     }
 
     private val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
@@ -58,6 +60,9 @@ class BluetoothAudioService(
 
     private val _connectionState = MutableStateFlow<ConnectionState>(ConnectionState.Disconnected)
     val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
+
+    private val _connectedDevices = MutableStateFlow<List<BluetoothDeviceInfo>>(emptyList())
+    val connectedDevices: StateFlow<List<BluetoothDeviceInfo>> = _connectedDevices.asStateFlow()
 
     private val _discoveredDevices = MutableStateFlow<List<BluetoothDeviceInfo>>(emptyList())
     val discoveredDevices: StateFlow<List<BluetoothDeviceInfo>> = _discoveredDevices.asStateFlow()
@@ -68,7 +73,9 @@ class BluetoothAudioService(
     private val scope = CoroutineScope(Dispatchers.IO)
     private var acceptJob: Job? = null
     private var connectJob: Job? = null
-    private var connectedWorker: ConnectedWorker? = null
+    // One RFCOMM worker per source; a receiver may accept phone + Windows simultaneously.
+    private val connections = linkedMapOf<String, ConnectedWorker>()
+    private val connectionNames = linkedMapOf<String, String>()
     private var serverSocket: BluetoothServerSocket? = null
 
     private var isReceiverRegistered = false
@@ -173,47 +180,34 @@ class BluetoothAudioService(
         }
     }
 
+
+    /** Keep the server socket open when the first peer connects so a second peer can join. */
     @SuppressLint("MissingPermission")
     fun startListening() {
         val adapter = bluetoothAdapter ?: return
-        stopListening()
-        disconnectCurrentConnection()
-
-        val localName = try {
-            adapter.name ?: "This Phone"
-        } catch (e: Exception) {
-            "This Phone"
-        }
-
-        _connectionState.value = ConnectionState.Listening(localName)
-
+        if (acceptJob?.isActive == true) return
+        val localName = try { adapter.name ?: "This Phone" } catch (_: Exception) { "This Phone" }
+        if (_connectedDevices.value.isEmpty()) _connectionState.value = ConnectionState.Listening(localName)
         acceptJob = scope.launch {
             try {
-                serverSocket = adapter.listenUsingRfcommWithServiceRecord(SERVICE_NAME, SPP_UUID)
-                Log.d(TAG, "Listening on RFCOMM for incoming connection...")
-                val socket = serverSocket?.accept()
-                if (socket != null) {
-                    serverSocket?.close()
-                    serverSocket = null
-                    val remoteDev = socket.remoteDevice
-                    val remoteName = try {
-                        remoteDev.name ?: remoteDev.address
-                    } catch (e: Exception) {
-                        remoteDev.address
-                    }
-                    withContext(Dispatchers.Main) {
-                        _connectionState.value = ConnectionState.Connected(remoteName, remoteDev.address)
-                    }
-                    connectedWorker = ConnectedWorker(socket)
-                    connectedWorker?.start()
-                }
-            } catch (e: IOException) {
-                Log.d(TAG, "Server socket closed or interrupted: ${e.message}")
-                if (_connectionState.value is ConnectionState.Listening) {
-                    withContext(Dispatchers.Main) {
-                        _connectionState.value = ConnectionState.Disconnected
+                val server = adapter.listenUsingRfcommWithServiceRecord(SERVICE_NAME, SPP_UUID)
+                serverSocket = server
+                Log.i(TAG, "Bluetooth SPP server listening (up to $MAX_CONNECTIONS peers)")
+                while (isActive) {
+                    val socket = server.accept() ?: continue
+                    val remote = socket.remoteDevice
+                    val name = try { remote.name ?: remote.address } catch (_: Exception) { remote.address }
+                    if (!registerConnection(socket, name)) {
+                        Log.w(TAG, "Ignoring extra/duplicate Bluetooth connection from ${remote.address}")
+                        try { socket.close() } catch (_: Exception) {}
                     }
                 }
+            } catch (e: Exception) {
+                Log.d(TAG, "Bluetooth listen ended: ${e.message}")
+            } finally {
+                try { serverSocket?.close() } catch (_: Exception) {}
+                serverSocket = null
+                if (isActive) updateConnectionState(false)
             }
         }
     }
@@ -221,116 +215,177 @@ class BluetoothAudioService(
     fun stopListening() {
         acceptJob?.cancel()
         acceptJob = null
-        try {
-            serverSocket?.close()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error closing server socket: ${e.message}")
+        try { serverSocket?.close() } catch (e: Exception) {
+            Log.w(TAG, "Error stopping Bluetooth listener", e)
         }
         serverSocket = null
+        updateConnectionState(false)
     }
 
     @SuppressLint("MissingPermission")
     fun connectToDevice(deviceAddress: String, deviceName: String? = null) {
         val adapter = bluetoothAdapter ?: return
-        stopListening()
-        disconnectCurrentConnection()
-
+        synchronized(connections) {
+            if (connections.containsKey(deviceAddress) || connections.size >= MAX_CONNECTIONS) return
+        }
+        connectJob?.cancel()
         val name = deviceName ?: deviceAddress
-        _connectionState.value = ConnectionState.Connecting(name, deviceAddress)
-
+        if (_connectedDevices.value.isEmpty()) _connectionState.value = ConnectionState.Connecting(name, deviceAddress)
         connectJob = scope.launch {
+            var socket: BluetoothSocket? = null
+            var registered = false
             try {
                 adapter.cancelDiscovery()
                 val device = adapter.getRemoteDevice(deviceAddress)
-                var socket: BluetoothSocket? = null
-
-                // 1. Try standard SPP UUID
                 try {
                     socket = device.createRfcommSocketToServiceRecord(SPP_UUID)
                     socket.connect()
                 } catch (e: IOException) {
-                    Log.w(TAG, "Standard RFCOMM failed, attempting reflection fallback: ${e.message}")
-                    socket?.close()
-                    // 2. Reflection fallback for non-standard device Bluetooth stacks
-                    val fallbackMethod = device.javaClass.getMethod("createRfcommSocket", Int::class.javaPrimitiveType)
-                    socket = fallbackMethod.invoke(device, 1) as BluetoothSocket
+                    Log.w(TAG, "Standard RFCOMM connect failed; trying channel 1: ${e.message}")
+                    try { socket?.close() } catch (_: Exception) {}
+                    val fallback = device.javaClass.getMethod("createRfcommSocket", Int::class.javaPrimitiveType)
+                    socket = fallback.invoke(device, 1) as BluetoothSocket
                     socket.connect()
                 }
-
-                if (socket != null && socket.isConnected) {
-                    withContext(Dispatchers.Main) {
-                        _connectionState.value = ConnectionState.Connected(name, deviceAddress)
-                    }
-                    connectedWorker = ConnectedWorker(socket)
-                    connectedWorker?.start()
-                } else {
-                    throw IOException("Socket could not connect")
-                }
+                val connected = socket ?: throw IOException("No Bluetooth socket")
+                registered = registerConnection(connected, name)
+                if (!registered) Log.w(TAG, "Connection rejected: already connected or at capacity")
             } catch (e: Exception) {
-                Log.e(TAG, "Connection failed: ${e.message}")
-                withContext(Dispatchers.Main) {
-                    _connectionState.value = ConnectionState.Disconnected
+                Log.e(TAG, "Bluetooth connection failed: ${e.message}")
+            } finally {
+                if (!registered) {
+                    try { socket?.close() } catch (_: Exception) {}
                 }
+                updateConnectionState(acceptJob?.isActive == true)
             }
         }
     }
 
-    fun disconnect() {
-        stopListening()
-        disconnectCurrentConnection()
-        _connectionState.value = ConnectionState.Disconnected
+    @SuppressLint("MissingPermission")
+    private fun registerConnection(socket: BluetoothSocket, name: String): Boolean {
+        val address = socket.remoteDevice.address
+        val worker: ConnectedWorker
+        synchronized(connections) {
+            if (connections.containsKey(address) || connections.size >= MAX_CONNECTIONS) return false
+            worker = ConnectedWorker(socket, address)
+            connections[address] = worker
+            connectionNames[address] = name
+            updateConnectionState(acceptJob?.isActive == true)
+        }
+        worker.start()
+        Log.i(TAG, "Connected Bluetooth sources: ${_connectedDevices.value.size}/$MAX_CONNECTIONS")
+        return true
     }
 
-    private fun disconnectCurrentConnection() {
-        connectJob?.cancel()
-        connectJob = null
-        connectedWorker?.cancel()
-        connectedWorker = null
-    }
-
-    private val encoderState = com.example.audio.AdpcmCodec.CodecState()
-
-    fun sendAudio(data: ByteArray) {
-        if (connectedWorker == null || data.isEmpty()) return
-        try {
-            val compressed = com.example.audio.AdpcmCodec.encode(data, encoderState)
-            connectedWorker?.queuePacket(TYPE_AUDIO_ADPCM, compressed)
-        } catch (e: Exception) {
-            connectedWorker?.queuePacket(TYPE_AUDIO, data)
+    private fun updateConnectionState(listening: Boolean) {
+        synchronized(connections) {
+            _connectedDevices.value = connections.keys.map { address ->
+                BluetoothDeviceInfo(name = connectionNames[address] ?: address, address = address, isPaired = true)
+            }
+            val first = _connectedDevices.value.firstOrNull()
+            _connectionState.value = when {
+                first != null -> ConnectionState.Connected(first.name, first.address)
+                listening -> ConnectionState.Listening("This Phone")
+                else -> ConnectionState.Disconnected
+            }
         }
     }
 
+    private fun onWorkerDisconnected(address: String, worker: ConnectedWorker) {
+        synchronized(connections) {
+            if (connections[address] !== worker) return
+            connections.remove(address)
+            connectionNames.remove(address)
+            updateConnectionState(acceptJob?.isActive == true)
+        }
+        Log.i(TAG, "Disconnected Bluetooth source $address")
+    }
+
+    fun disconnectDevice(deviceAddress: String) {
+        val worker = synchronized(connections) {
+            connectionNames.remove(deviceAddress)
+            connections.remove(deviceAddress)
+        }
+        worker?.cancel()
+        updateConnectionState(acceptJob?.isActive == true)
+    }
+
+    fun disconnect() {
+        stopListening()
+        connectJob?.cancel()
+        connectJob = null
+        val peers = synchronized(connections) {
+            val active = connections.values.toList()
+            connections.clear()
+            connectionNames.clear()
+            active
+        }
+        peers.forEach { it.cancel() }
+        encoderState.reset()
+        updateConnectionState(false)
+    }
+
+    private fun activeWorkers(): List<ConnectedWorker> =
+        synchronized(connections) { connections.values.toList() }
+
+    private val encoderState = com.example.audio.AdpcmCodec.CodecState()
+    @Volatile
+    var lowLatencyEnabled: Boolean = false
+        set(value) {
+            field = value
+            activeWorkers().forEach { it.setLowLatency(value) }
+        }
+
+    @Synchronized
+    fun sendAudio(data: ByteArray) {
+        val peers = activeWorkers()
+        if (peers.isEmpty() || data.isEmpty()) return
+        try {
+            val compressed = com.example.audio.AdpcmCodec.encode(data, encoderState)
+            peers.forEach { it.queuePacket(TYPE_AUDIO_ADPCM, compressed) }
+        } catch (e: Exception) {
+            Log.w(TAG, "ADPCM encode failed, using PCM", e)
+            peers.forEach { it.queuePacket(TYPE_AUDIO, data) }
+        }
+    }
+
+    @Synchronized
     fun clearAudioQueue() {
         encoderState.reset()
-        connectedWorker?.clearAudioQueue()
+        activeWorkers().forEach { it.clearAudioQueue() }
     }
 
-    fun sendPttStart() {
-        connectedWorker?.queuePacket(TYPE_PTT_START, ByteArray(0))
-    }
+    fun sendPttStart() = activeWorkers().forEach { it.queuePacket(TYPE_PTT_START, ByteArray(0)) }
 
-    fun sendPttEnd() {
-        connectedWorker?.queuePacket(TYPE_PTT_END, ByteArray(0))
-    }
+    fun sendPttEnd() = activeWorkers().forEach { it.queuePacket(TYPE_PTT_END, ByteArray(0)) }
 
     fun sendTextMessage(text: String) {
         val bytes = text.toByteArray(Charsets.UTF_8)
-        connectedWorker?.queuePacket(TYPE_TEXT, bytes)
+        if (bytes.size > 32768) return
+        activeWorkers().forEach { it.queuePacket(TYPE_TEXT, bytes) }
+    }
+
+    fun sendLatencyConfig(enabled: Boolean = lowLatencyEnabled) {
+        activeWorkers().forEach { it.queuePacket(TYPE_LATENCY_CONFIG, byteArrayOf(if (enabled) 1 else 0)) }
     }
 
     fun sendConfig(sampleRate: Int) {
         val bytes = ByteBuffer.allocate(4).putInt(sampleRate).array()
-        connectedWorker?.queuePacket(TYPE_CONFIG, bytes)
+        activeWorkers().forEach { it.queuePacket(TYPE_CONFIG, bytes) }
     }
 
-    private inner class ConnectedWorker(private val socket: BluetoothSocket) {
+    private inner class ConnectedWorker(private val socket: BluetoothSocket, private val address: String) {
         @Volatile
         private var isRunning = true
         private val inStream = DataInputStream(BufferedInputStream(socket.inputStream, 16384))
         private val outStream = DataOutputStream(BufferedOutputStream(socket.outputStream, 16384))
 
         // Buffer capacity 30 packets (~600ms headroom to smoothly absorb RFCOMM jitter without dropping frames)
-        private val sendQueue = LinkedBlockingQueue<Pair<Byte, ByteArray>>(30)
+        private val sendQueue = OutgoingPacketQueue(30, 15) { it == TYPE_AUDIO || it == TYPE_AUDIO_ADPCM }
+
+        fun setLowLatency(enabled: Boolean) {
+            sendQueue.maxAudioPackets = if (enabled) 6 else 15
+        }
 
         private var readJob: Job? = null
         private var writeJob: Job? = null
@@ -340,6 +395,7 @@ class BluetoothAudioService(
         private var lastSendTime = System.currentTimeMillis()
 
         fun start() {
+            setLowLatency(lowLatencyEnabled)
             // Dedicated Single-Threaded Write Loop
             writeJob = scope.launch {
                 try {
@@ -403,7 +459,7 @@ class BluetoothAudioService(
 
                         // Safely dispatch to listener
                         try {
-                            onPacketReceived(type, payload)
+                            onPacketReceived(address, type, payload)
                         } catch (t: Throwable) {
                             Log.e(TAG, "Error in onPacketReceived callback: ${t.message}")
                         }
@@ -420,33 +476,20 @@ class BluetoothAudioService(
             if (!isRunning) return
             // Soft ceiling to prevent bufferbloat while allowing natural Bluetooth bursts:
             // Only prune if queue backs up beyond 15 packets (~300ms)
-            if (type == TYPE_AUDIO || type == TYPE_AUDIO_ADPCM) {
-                while (sendQueue.size >= 15) {
-                    sendQueue.poll()
-                }
+            if (!sendQueue.offer(type, payload)) {
+                Log.w(TAG, "Bluetooth queue full of control packets; dropped packet type=$type")
             }
-            sendQueue.offer(Pair(type, payload))
         }
 
         fun clearAudioQueue() {
-            val iterator = sendQueue.iterator()
-            while (iterator.hasNext()) {
-                val item = iterator.next()
-                if (item.first == TYPE_AUDIO || item.first == TYPE_AUDIO_ADPCM) {
-                    iterator.remove()
-                }
-            }
+            sendQueue.clearAudio()
         }
 
         private fun onDisconnectOccurred() {
             if (!isRunning) return
             isRunning = false
             cancel()
-            scope.launch(Dispatchers.Main) {
-                if (_connectionState.value is ConnectionState.Connected) {
-                    _connectionState.value = ConnectionState.Disconnected
-                }
-            }
+            onWorkerDisconnected(address, this)
         }
 
         fun cancel() {

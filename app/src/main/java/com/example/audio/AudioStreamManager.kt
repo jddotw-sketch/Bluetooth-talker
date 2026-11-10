@@ -27,6 +27,7 @@ import kotlinx.coroutines.launch
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
 import kotlin.math.PI
 import kotlin.math.sin
 import kotlin.math.sqrt
@@ -61,11 +62,30 @@ class AudioStreamManager(
     private var recordingJob: Job? = null
     @Volatile
     private var isRecording = false
+    @Volatile
     private var isLoopback = false
+    @Volatile
+    private var playbackSampleRate = AudioQuality.HI_FI_44K.sampleRate
+    @Volatile
+    private var remoteSampleRate: Int? = null
 
     var micGain: Float = 1.2f
     var isMuted: Boolean = false
     var rogerBeepEnabled: Boolean = true
+    @Volatile
+    var lowLatencyEnabled: Boolean = false
+
+    /** Play remote speech on the media stream without requesting exclusive audio focus. */
+    @Volatile
+    var mixWithOtherAudio: Boolean = true
+        private set
+
+    fun setMixWithOtherAudio(enabled: Boolean) {
+        if (mixWithOtherAudio == enabled) return
+        mixWithOtherAudio = enabled
+        // AudioAttributes are immutable, so create a new track at the same sample rate.
+        initAudioTrack(playbackSampleRate, force = true)
+    }
 
     // MediaProjection instance for Audio Relay (capturing all app/system audio)
     var mediaProjection: MediaProjection? = null
@@ -107,15 +127,28 @@ class AudioStreamManager(
     fun setAudioQuality(quality: AudioQuality) {
         if (currentQuality == quality) return
         currentQuality = quality
-        initAudioTrack(quality.sampleRate)
+        // Changing our microphone quality must not retune playback of the peer's audio.
+        if (remoteSampleRate == null && !isLoopback) {
+            initAudioTrack(quality.sampleRate)
+        }
     }
 
     fun setRemoteSampleRate(sampleRate: Int) {
-        val targetQuality = if (sampleRate >= 32000) AudioQuality.HI_FI_44K else AudioQuality.STANDARD_16K
-        if (currentQuality.sampleRate != sampleRate) {
-            Log.d(TAG, "Adapting AudioTrack to remote sample rate: $sampleRate Hz")
-            currentQuality = targetQuality
+        if (sampleRate !in listOf(16000, 44100, 48000)) {
+            Log.w(TAG, "Ignoring unsupported peer sample rate: $sampleRate")
+            return
+        }
+        remoteSampleRate = sampleRate
+        if (!isLoopback && playbackSampleRate != sampleRate) {
+            Log.d(TAG, "Configuring receiver for $sampleRate Hz peer audio")
             initAudioTrack(sampleRate)
+        }
+    }
+
+    fun resetRemoteSampleRate() {
+        remoteSampleRate = null
+        if (!isLoopback && playbackSampleRate != currentQuality.sampleRate) {
+            initAudioTrack(currentQuality.sampleRate)
         }
     }
 
@@ -143,86 +176,116 @@ class AudioStreamManager(
     }
 
     @Synchronized
-    private fun initAudioTrack(sampleRate: Int) {
+    private fun initAudioTrack(sampleRate: Int, force: Boolean = false) {
+        if (!force && playbackSampleRate == sampleRate && audioTrack?.state == AudioTrack.STATE_INITIALIZED) return
         try {
-            audioTrack?.let { oldTrack ->
-                try {
-                    oldTrack.stop()
-                    oldTrack.release()
-                } catch (ignored: Exception) {}
-            }
-
             val minBufSize = AudioTrack.getMinBufferSize(
                 sampleRate,
                 AudioFormat.CHANNEL_OUT_MONO,
                 AudioFormat.ENCODING_PCM_16BIT
             )
-            val validMinBuf = if (minBufSize > 0) minBufSize else 4096
-            val bufferSize = maxOf(validMinBuf * 3, 8192)
-
+            if (minBufSize <= 0) {
+                Log.e(TAG, "AudioTrack does not support $sampleRate Hz")
+                return
+            }
+            val bufferSize = maxOf(minBufSize * 3, 8192)
             val audioAttributes = AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_MEDIA)
-                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                .setContentType(if (mixWithOtherAudio) AudioAttributes.CONTENT_TYPE_SPEECH else AudioAttributes.CONTENT_TYPE_MUSIC)
                 .build()
-
             val audioFormat = AudioFormat.Builder()
                 .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                 .setSampleRate(sampleRate)
                 .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                 .build()
-
-            audioTrack = AudioTrack.Builder()
+            val replacement = AudioTrack.Builder()
                 .setAudioAttributes(audioAttributes)
                 .setAudioFormat(audioFormat)
                 .setBufferSizeInBytes(bufferSize)
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .build()
 
-            if (audioTrack?.state == AudioTrack.STATE_INITIALIZED) {
-                audioTrack?.play()
-            } else {
+            if (replacement.state != AudioTrack.STATE_INITIALIZED) {
                 Log.e(TAG, "AudioTrack failed to initialize at $sampleRate Hz")
+                replacement.release()
+                return
+            }
+            try {
+                replacement.play()
+            } catch (e: Exception) {
+                replacement.release()
+                throw e
+            }
+
+            // Keep the old output intact if creating its replacement fails.
+            val previous = audioTrack
+            audioTrack = replacement
+            playbackSampleRate = sampleRate
+            try {
+                previous?.stop()
+                previous?.release()
+            } catch (e: Exception) {
+                Log.w(TAG, "Old AudioTrack cleanup failed: ${e.message}")
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to init AudioTrack: ${e.message}")
+            Log.e(TAG, "Failed to initialize AudioTrack at $sampleRate Hz: ${e.message}")
         }
     }
 
+    /**
+     * Start with a small jitter buffer once per talkspurt, rather than pausing
+     * for another prebuffer every time a single Bluetooth packet arrives late.
+     */
     private fun startPlaybackWorker() {
         playbackJob?.cancel()
         playbackJob = scope.launch {
-            val preBufferThreshold = 3 // Pre-buffer 3 packets (~60ms) before playing to eliminate drops & cuts
-
+            var needsPrebuffer = true
             while (isActive) {
                 try {
-                    // When queue has drained empty, wait for pre-buffer to fill
-                    // so AudioTrack is never starved on the first or jittered packet
-                    if (playbackQueue.isEmpty()) {
-                        while (isActive && playbackQueue.size < preBufferThreshold) {
-                            delay(6)
+                    val data = playbackQueue.poll(120, TimeUnit.MILLISECONDS)
+                    if (data == null) {
+                        needsPrebuffer = true
+                        continue
+                    }
+                    if (needsPrebuffer) {
+                        val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(50)
+                        while (isActive && playbackQueue.size < 2 && System.nanoTime() < deadline) {
+                            delay(5)
                         }
+                        needsPrebuffer = false
                     }
-
-                    val data = playbackQueue.poll() ?: continue
-                    if (audioTrack == null || audioTrack?.state != AudioTrack.STATE_INITIALIZED) {
-                        initAudioTrack(currentQuality.sampleRate)
-                    }
-                    audioTrack?.let { track ->
-                        if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
-                            try {
-                                track.play()
-                            } catch (e: Exception) {
-                                Log.e(TAG, "Error starting playback: ${e.message}")
-                            }
-                        }
-                        track.write(data, 0, data.size)
-                    }
+                    writePlaybackFrame(data)
                 } catch (e: InterruptedException) {
                     break
                 } catch (e: Exception) {
+                    if (!isActive) break
                     Log.e(TAG, "Error in playback worker: ${e.message}")
                 }
             }
+        }
+    }
+
+    @Synchronized
+    private fun writePlaybackFrame(data: ByteArray) {
+        if (data.isEmpty()) return
+        if (audioTrack?.state != AudioTrack.STATE_INITIALIZED) {
+            initAudioTrack(remoteSampleRate ?: currentQuality.sampleRate)
+        }
+        val track = audioTrack ?: return
+        try {
+            if (track.playState != AudioTrack.PLAYSTATE_PLAYING) track.play()
+            var offset = 0
+            while (offset < data.size) {
+                // Android can return a partial write after a route or output state change.
+                val count = track.write(data, offset, data.size - offset, AudioTrack.WRITE_BLOCKING)
+                if (count <= 0) {
+                    Log.w(TAG, "AudioTrack.write failed with code $count")
+                    return
+                }
+                offset += count
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "AudioTrack playback error: ${e.message}")
         }
     }
 
@@ -266,6 +329,14 @@ class AudioStreamManager(
             } catch (e: Exception) {
                 Log.e(TAG, "AudioPlaybackCapture config failed: ${e.message}")
             }
+        }
+
+        // System-audio relay must never silently switch to the microphone. If
+        // capture is denied/unavailable, send no audio and surface an error
+        // instead of broadcasting room noise while the UI says App Audio Relay.
+        if (sourceMode == AudioSourceMode.APP_AUDIO_RELAY) {
+            Log.e(TAG, "App audio relay unavailable: missing/invalid MediaProjection or AudioRecord")
+            return null
         }
 
         // 2. Microphone capture: Test candidate rates and audio sources supported by device hardware
@@ -319,11 +390,16 @@ class AudioStreamManager(
 
             val (record, actualRate) = pair
             audioRecord = record
-
-            if (actualRate != currentQuality.sampleRate) {
-                Log.d(TAG, "Recording at hardware sample rate $actualRate Hz (requested ${currentQuality.sampleRate})")
-                onSampleRateChanged(actualRate)
+            if (loopbackMode && playbackSampleRate != actualRate) {
+                initAudioTrack(actualRate)
             }
+
+            // Always announce the *actual* capture rate for every new transmission.
+            // The remote receiver may be at another rate (for example, 16 kHz
+            // from a Windows peer), and the initial connection config may have
+            // been sent before Android selected its recording hardware format.
+            Log.d(TAG, "Recording at hardware sample rate $actualRate Hz (requested ${currentQuality.sampleRate})")
+            if (!loopbackMode) onSampleRateChanged(actualRate)
 
             try {
                 record.startRecording()
@@ -335,7 +411,8 @@ class AudioStreamManager(
 
             isRecording = true
 
-            val chunkSize = (actualRate * 2 * 20) / 1000 // 20ms of audio
+            val packetMs = AudioLatencyProfile.capturePacketMs(actualRate, lowLatencyEnabled)
+            val chunkSize = (actualRate * 2 * packetMs) / 1000
 
             recordingJob = scope.launch {
                 try {
@@ -343,20 +420,29 @@ class AudioStreamManager(
                     while (isActive && isRecording) {
                         val rec = audioRecord ?: break
                         var totalRead = 0
+                        var readFailed = false
                         while (totalRead < chunkSize && isActive && isRecording) {
+                            // AudioRecord may return fewer bytes than requested. Never transmit
+                            // the incomplete frame: it causes irregular timing and ADPCM padding.
                             val count = try {
-                                rec.read(buffer, totalRead, chunkSize - totalRead)
+                                rec.read(buffer, totalRead, chunkSize - totalRead, AudioRecord.READ_BLOCKING)
                             } catch (e: Exception) {
+                                Log.w(TAG, "AudioRecord.read failed: ${e.message}")
                                 -1
                             }
-                            if (count <= 0) {
-                                delay(6)
-                                break
+                            when {
+                                count > 0 -> totalRead += count
+                                count == 0 -> delay(2)
+                                else -> {
+                                    Log.w(TAG, "AudioRecord returned error $count")
+                                    readFailed = true
+                                    break
+                                }
                             }
-                            totalRead += count
                         }
 
-                        if (totalRead > 0) {
+                        if (readFailed) break
+                        if (totalRead == chunkSize && isActive && isRecording) {
                             val processed = if (isMuted) {
                                 ByteArray(totalRead)
                             } else {
@@ -384,6 +470,8 @@ class AudioStreamManager(
 
     fun stopRecording() {
         isRecording = false
+        val wasLoopback = isLoopback
+        isLoopback = false
         recordingJob?.cancel()
         recordingJob = null
         try {
@@ -393,15 +481,18 @@ class AudioStreamManager(
             Log.e(TAG, "stopRecording error: ${e.message}")
         }
         audioRecord = null
+        if (wasLoopback) {
+            val outputRate = remoteSampleRate ?: currentQuality.sampleRate
+            if (playbackSampleRate != outputRate) initAudioTrack(outputRate)
+        }
         onAmplitudeChanged(true, 0f)
     }
 
     fun playIncomingAudio(data: ByteArray) {
         if (data.isEmpty()) return
-        // Allow up to 10 packets (~200ms) to absorb natural RFCOMM packet bursts.
-        // If queue exceeds 10 packets due to drift or sustained delay, trim oldest packet
-        // to maintain low latency (< 160ms) without ever causing audio cuts.
-        while (playbackQueue.size >= 10) {
+        // Keep enough capacity for brief scheduling or RFCOMM bursts before
+        // discarding speech. Normal latency is set by the ~60ms startup prebuffer.
+        while (playbackQueue.size >= 20) {
             playbackQueue.poll()
         }
         playbackQueue.offer(data)
@@ -496,7 +587,7 @@ class AudioStreamManager(
     }
 
     private fun generateTone(frequencyHz: Double, durationMs: Int, volume: Float): ByteArray {
-        val sampleRate = currentQuality.sampleRate
+        val sampleRate = playbackSampleRate
         val numSamples = (sampleRate * durationMs) / 1000
         val shortArray = ShortArray(numSamples)
         for (i in 0 until numSamples) {

@@ -13,6 +13,7 @@ import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.audio.AudioStreamManager
+import com.example.audio.PeerAudioMixer
 import com.example.bluetooth.BluetoothAudioService
 import com.example.model.AudioQuality
 import com.example.model.AudioRoute
@@ -22,6 +23,7 @@ import com.example.model.ChatMessage
 import com.example.model.ConnectionState
 import com.example.model.WalkieMode
 import com.example.service.AudioRelayService
+import com.example.service.BluetoothSessionService
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -36,10 +38,13 @@ data class WalkieTalkieUiState(
     val bluetoothEnabled: Boolean = false,
     val permissionsGranted: Boolean = false,
     val connectionState: ConnectionState = ConnectionState.Disconnected,
+    val connectedPeers: List<BluetoothDeviceInfo> = emptyList(),
     val walkieMode: WalkieMode = WalkieMode.PUSH_TO_TALK,
     val audioSourceMode: AudioSourceMode = AudioSourceMode.MICROPHONE, // Default to Microphone Walkie-Talkie
     val audioQuality: AudioQuality = AudioQuality.HI_FI_44K,           // Hi-Fi quality mode
-    val audioRoute: AudioRoute = AudioRoute.HEADSET_OR_AUTO,          // 3.5mm Headset / Auto
+    val audioRoute: AudioRoute = AudioRoute.HEADSET_OR_AUTO,
+    val mixWithOtherAudio: Boolean = true,
+    val lowLatencyEnabled: Boolean = false,          // 3.5mm Headset / Auto
     val isHeadsetPlugged: Boolean = false,
     val autoConnectEnabled: Boolean = true,
     val lastConnectedDeviceName: String? = null,
@@ -73,6 +78,8 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
         private const val KEY_LAST_NAME = "last_connected_name"
         private const val KEY_QUALITY = "audio_quality"
         private const val KEY_ROUTE = "audio_route"
+        private const val KEY_MIX_AUDIO = "mix_with_other_audio"
+        private const val KEY_LOW_LATENCY = "low_latency_audio"
     }
 
     private val prefs: SharedPreferences = application.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -80,6 +87,8 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
     private val _uiState = MutableStateFlow(
         WalkieTalkieUiState(
             autoConnectEnabled = prefs.getBoolean(KEY_AUTO_CONNECT, true),
+            mixWithOtherAudio = prefs.getBoolean(KEY_MIX_AUDIO, true),
+            lowLatencyEnabled = prefs.getBoolean(KEY_LOW_LATENCY, false),
             lastConnectedDeviceAddress = prefs.getString(KEY_LAST_ADDR, null),
             lastConnectedDeviceName = prefs.getString(KEY_LAST_NAME, null),
             audioQuality = try {
@@ -102,8 +111,10 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
 
     private val mediaProjectionManager = application.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as? MediaProjectionManager
 
-    val audioService: BluetoothAudioService = BluetoothAudioService(application) { type, payload ->
-        handleIncomingPacket(type, payload)
+    private val peerAudioMixer = PeerAudioMixer()
+
+    val audioService: BluetoothAudioService = BluetoothAudioService(application) { address, type, payload ->
+        handleIncomingPacket(address, type, payload)
     }
 
     val audioStreamManager: AudioStreamManager = AudioStreamManager(
@@ -135,6 +146,9 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
     )
 
     init {
+        audioStreamManager.setMixWithOtherAudio(_uiState.value.mixWithOtherAudio)
+        audioStreamManager.lowLatencyEnabled = _uiState.value.lowLatencyEnabled
+        audioService.lowLatencyEnabled = _uiState.value.lowLatencyEnabled
         audioStreamManager.setAudioQuality(_uiState.value.audioQuality)
         audioStreamManager.setAudioOutputRoute(_uiState.value.audioRoute)
 
@@ -146,6 +160,7 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
                 when (connState) {
                     is ConnectionState.Connected -> {
                         autoReconnectJob?.cancel()
+                        BluetoothSessionService.start(getApplication())
                         // Save last connected device for auto-connect
                         prefs.edit()
                             .putString(KEY_LAST_ADDR, connState.deviceAddress)
@@ -162,6 +177,8 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
                         showStatusNotification("Connected to ${connState.deviceName} (Hi-Fi Link Ready)")
                     }
                     is ConnectionState.Disconnected -> {
+                        BluetoothSessionService.stop(getApplication())
+                        audioStreamManager.resetRemoteSampleRate()
                         if (_uiState.value.isTransmitting && !_uiState.value.isLoopbackTestActive) {
                             stopTransmitting()
                         }
@@ -170,6 +187,19 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
                         scheduleAutoReconnect()
                     }
                     else -> {}
+                }
+            }
+        }
+
+        viewModelScope.launch {
+            audioService.connectedDevices.collect { peers ->
+                _uiState.update { it.copy(connectedPeers = peers) }
+                peerAudioMixer.retain(peers.map { it.address }.toSet())
+                if (peers.isNotEmpty()) {
+                    BluetoothSessionService.start(getApplication())
+                    // New peers need their own playback configuration even when
+                    // the primary connection stays unchanged.
+                    audioService.sendConfig(_uiState.value.audioQuality.sampleRate)
                 }
             }
         }
@@ -220,6 +250,24 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
             audioService.sendConfig(quality.sampleRate)
         }
         showStatusNotification("Quality: ${quality.label}")
+    }
+
+    fun toggleLowLatency() {
+        val enabled = !_uiState.value.lowLatencyEnabled
+        if (_uiState.value.isTransmitting) stopTransmitting()
+        prefs.edit().putBoolean(KEY_LOW_LATENCY, enabled).apply()
+        _uiState.update { it.copy(lowLatencyEnabled = enabled) }
+        audioStreamManager.lowLatencyEnabled = enabled
+        audioService.lowLatencyEnabled = enabled
+        showStatusNotification(if (enabled) "Low latency enabled (shorter buffers)" else "Smooth playback mode enabled")
+    }
+
+    fun toggleMixWithOtherAudio() {
+        val enabled = !_uiState.value.mixWithOtherAudio
+        prefs.edit().putBoolean(KEY_MIX_AUDIO, enabled).apply()
+        _uiState.update { it.copy(mixWithOtherAudio = enabled) }
+        audioStreamManager.setMixWithOtherAudio(enabled)
+        showStatusNotification(if (enabled) "Voice over other audio enabled" else "Normal audio playback mode")
     }
 
     fun setAudioRoute(route: AudioRoute) {
@@ -277,12 +325,19 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
         showStatusNotification("Connecting to ${device.name}...")
     }
 
+    fun disconnectPeer(address: String) {
+        audioService.disconnectDevice(address)
+        peerAudioMixer.remove(address)
+    }
+
     fun disconnect() {
         autoReconnectJob?.cancel()
         if (_uiState.value.isTransmitting) {
             stopTransmitting()
         }
         audioService.disconnect()
+        BluetoothSessionService.stop(getApplication())
+        audioStreamManager.resetRemoteSampleRate()
         showStatusNotification("Disconnected")
     }
 
@@ -396,6 +451,13 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
                 audioStreamManager.playPttStartChirp()
             }
 
+            // PTT must precede PCM frames, including when the audio capture coroutine
+            // starts immediately on a fast device. Preserve the peer's receive queue.
+            if (isConnected && !isLoopback) {
+                audioService.sendLatencyConfig()
+                audioService.sendPttStart()
+            }
+
             val started = audioStreamManager.startRecording(
                 sourceMode = _uiState.value.audioSourceMode,
                 loopbackMode = isLoopback
@@ -403,10 +465,8 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
 
             if (started) {
                 _uiState.update { it.copy(isTransmitting = true) }
-                if (isConnected && !isLoopback) {
-                    audioService.sendPttStart()
-                }
             } else {
+                if (isConnected && !isLoopback) audioService.sendPttEnd()
                 showStatusNotification("Microphone busy or unavailable")
             }
         } catch (t: Throwable) {
@@ -421,7 +481,8 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
         try {
             audioStreamManager.stopRecording()
         } catch (ignored: Exception) {}
-        audioService.clearAudioQueue()
+        // Retain queued final audio frames. Removing them here cuts off the end of words.
+        // The next PTT start explicitly clears any stale backlog instead.
 
         val isConnected = _uiState.value.connectionState is ConnectionState.Connected
         val isLoopback = _uiState.value.isLoopbackTestActive
@@ -509,7 +570,7 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
         _uiState.update { it.copy(statusNotification = message) }
     }
 
-    private fun handleIncomingPacket(type: Byte, payload: ByteArray) {
+    private fun handleIncomingPacket(address: String, type: Byte, payload: ByteArray) {
         when (type) {
             BluetoothAudioService.TYPE_AUDIO_ADPCM -> {
                 val pcm = try {
@@ -517,31 +578,33 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
                 } catch (e: Exception) {
                     payload
                 }
-                audioStreamManager.playIncomingAudio(pcm)
+                peerAudioMixer.receive(address, pcm)
                 _uiState.update { it.copy(isReceivingAudio = true) }
                 resetRxAudioTimeout()
             }
             BluetoothAudioService.TYPE_AUDIO -> {
-                audioStreamManager.playIncomingAudio(payload)
+                peerAudioMixer.receive(address, payload)
                 _uiState.update { it.copy(isReceivingAudio = true) }
                 resetRxAudioTimeout()
             }
             BluetoothAudioService.TYPE_PTT_START -> {
-                audioStreamManager.clearPlaybackQueue() // Reset delay on new transmission
-                audioStreamManager.playPttStartChirp()
+                // Do not clear buffers belonging to the other active source.
                 _uiState.update { it.copy(isReceivingAudio = true) }
             }
             BluetoothAudioService.TYPE_PTT_END -> {
                 audioStreamManager.playRogerBeep()
                 _uiState.update { it.copy(isReceivingAudio = false, rxAudioLevel = 0f) }
             }
+            BluetoothAudioService.TYPE_LATENCY_CONFIG -> {
+                if (payload.isNotEmpty()) peerAudioMixer.setLowLatency(address, payload[0].toInt() != 0)
+            }
             BluetoothAudioService.TYPE_CONFIG -> {
                 if (payload.size >= 4) {
                     val sampleRate = ByteBuffer.wrap(payload).int
-                    audioStreamManager.setRemoteSampleRate(sampleRate)
+                    peerAudioMixer.setSampleRate(address, sampleRate)
                     val quality = if (sampleRate >= 32000) AudioQuality.HI_FI_44K else AudioQuality.STANDARD_16K
-                    _uiState.update { it.copy(audioQuality = quality) }
-                    showStatusNotification("Remote configured: ${quality.label}")
+                    // Peer playback format does not change our local recording preference.
+                    showStatusNotification("Receiving audio: ${sampleRate} Hz (${quality.label})")
                 }
             }
             BluetoothAudioService.TYPE_TEXT -> {
@@ -574,7 +637,9 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
         rxTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
         autoReconnectJob?.cancel()
         AudioRelayService.stop(getApplication())
+        BluetoothSessionService.stop(getApplication())
         audioStreamManager.release()
+        peerAudioMixer.release()
         audioService.cleanup()
     }
 }

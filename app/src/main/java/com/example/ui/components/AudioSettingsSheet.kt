@@ -64,12 +64,16 @@ import com.example.ui.theme.TextSecondary
 fun AudioSettingsSheet(
     audioQuality: AudioQuality,
     audioRoute: AudioRoute,
+    mixWithOtherAudio: Boolean,
+    lowLatencyEnabled: Boolean,
     isHeadsetPlugged: Boolean,
     autoConnectEnabled: Boolean,
     lastConnectedName: String?,
     lastConnectedAddr: String?,
     onSetQuality: (AudioQuality) -> Unit,
     onSetRoute: (AudioRoute) -> Unit,
+    onToggleMixWithOtherAudio: () -> Unit,
+    onToggleLowLatency: () -> Unit,
     onToggleAutoConnect: () -> Unit,
     onConnectLastDevice: () -> Unit,
     onDismiss: () -> Unit,
@@ -252,6 +256,81 @@ fun AudioSettingsSheet(
                 onSelect = { onSetQuality(AudioQuality.STANDARD_16K) }
             )
 
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Card(
+                colors = CardDefaults.cardColors(containerColor = SlateCard),
+                shape = RoundedCornerShape(12.dp),
+                border = androidx.compose.foundation.BorderStroke(1.dp, SlateCardBorder),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(14.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Low-latency Android audio",
+                            color = TextPrimary,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Text(
+                            text = "Shorter capture and receiver buffers. Disable if Bluetooth audio breaks up.",
+                            color = TextSecondary,
+                            fontSize = 12.sp
+                        )
+                    }
+                    Switch(
+                        checked = lowLatencyEnabled,
+                        onCheckedChange = { onToggleLowLatency() },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = Color.Black,
+                            checkedTrackColor = CyanNeon
+                        ),
+                        modifier = Modifier.testTag("low_latency_audio_switch")
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.height(10.dp))
+
+            // Play remote speech concurrently with another media app.
+            Card(
+                colors = CardDefaults.cardColors(containerColor = SlateCard),
+                shape = RoundedCornerShape(12.dp),
+                border = androidx.compose.foundation.BorderStroke(1.dp, SlateCardBorder),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(14.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Voice over other audio",
+                            color = TextPrimary,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Text(
+                            text = "Mix incoming talk with music and videos when Android allows it",
+                            color = TextSecondary,
+                            fontSize = 12.sp
+                        )
+                    }
+                    Switch(
+                        checked = mixWithOtherAudio,
+                        onCheckedChange = { onToggleMixWithOtherAudio() },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = Color.Black,
+                            checkedTrackColor = CyanNeon
+                        ),
+                        modifier = Modifier.testTag("mix_with_other_audio_switch")
+                    )
+                }
+            }
             Spacer(modifier = Modifier.height(16.dp))
 
             // Section 3: Audio Output Destination (Headset / 3.5mm jack vs Loudspeaker)

@@ -1,0 +1,38 @@
+# BlueVoice: Windows 11 + two Bluetooth audio inputs (experimental)
+
+## Intended wiring
+
+- Android receiver (music box controller): enable **Receive phone + Windows audio (2 sources)** in BlueVoice. If your speaker has an AUX input, connect this Android device to the speaker using a wired headphone output or USB-C audio adapter.
+- Phone (source 1): install BlueVoice, connect to the Android receiver through BlueVoice, and choose **App Audio Relay**. Grant Android's screen/audio capture permission. **Start transmitting** to send permitted app playback.
+- Windows 11 PC (source 2): pair the PC with the Android receiver, identify the **outgoing Bluetooth Serial (SPP) COM port**, launch BlueVoice.Windows, choose that COM port and click **Connect + stream**.
+
+The Android receiver accepts two simultaneous **RFCOMM/SPP** application streams and plays them through independent AudioTrack outputs. Android's system audio mixer combines the output. The receiver shows the two connected device names separately.
+
+**Important:** This does *not* make an ordinary Bluetooth A2DP speaker accept and mix two audio streams directly. For standard Bluetooth speakers, use the Android receiver as an audio bridge, ideally with the speaker connected by AUX/USB audio. Multiple Bluetooth endpoints sharing a radio can reduce throughput and degrade quality.
+
+## Windows installation
+
+1. Open the GitHub Actions workflow **Build Windows 11 BlueVoice**.
+2. Download the `BlueVoice-Windows11-x64` artifact from a successful build.
+3. Unzip it and run `BlueVoice.Windows.exe` (Windows 11 x64). The published build is self-contained.
+4. Pair your Windows PC and Android receiver via Windows **Settings > Bluetooth & devices**.
+5. In the legacy Bluetooth settings, check **COM Ports** for an outgoing serial port associated with the receiver's RFCOMM service. Use that port in the app. If no outgoing SPP port is available, the current Windows transport cannot connect; some Windows Bluetooth adapters/drivers do not expose it.
+
+**Windows COM port baud-rate compatibility:** BlueVoice configures the virtual SPP serial port at **115200 baud**, since some Windows Bluetooth COM drivers reject higher settings (for example 921600). RFCOMM is not a physical UART, so the serial driver's baud-rate setting is not necessarily the real over-the-air throughput. If audio stalls, select **16 kHz mono** first; high-quality 44.1 kHz needs more sustained Bluetooth bandwidth.
+
+The app captures your current default Windows output audio via WASAPI loopback (other apps remain audible on the PC). It converts this to 16 kHz mono by default, or 44.1 kHz mono for higher fidelity, and compresses the stream with IMA ADPCM (roughly 4:1).
+
+**Latency switch:** Windows now includes **Low latency (faster, less buffering)**, disabled by default. When enabled at 16 kHz, BlueVoice uses 10 ms ADPCM packets, a target 25 ms shared-mode WASAPI capture buffer, a 6-frame drop-oldest send queue, and the Android receiver's short-buffer mode (control type `0x08`). At 44.1 kHz, packets remain 20 ms to avoid an extra ADPCM padding sample, but the receiver and capture buffering are still shortened. Turn the switch off and reconnect if your Bluetooth link begins to stutter; this preserves the prior stable Windows configuration. Install the latest Android receiver first so it understands the low-latency control frame. The 115200 virtual COM-port setting is unchanged. The actual wireless and OS latency cannot be guaranteed.
+
+## Limitations
+
+- Requires two Android-capable endpoints (phone and receiver) plus Windows 11. Receiver audio transport is Bluetooth Classic SPP, not Bluetooth A2DP or LE Audio broadcast.
+- The existing app's foreground service helps preserve processing priority, but on-device testing is still needed and it does not yet persist the receiver across OS process death.
+- Windows playback capture needs a running WASAPI render session and an audio format supported by the capture pipeline (float32 or signed PCM16).
+- Audio-mixing timing is managed by independent bounded playback tracks; there is no clock synchronization, echo cancellation or automatic volume ducking.
+- Some Android applications prevent playback capture for DRM/policy reasons; no workaround is implemented.
+- Both desktop and Android builds must pass CI before being considered installable, and two physical Bluetooth links must be tested.
+
+## Protocol
+
+Each RFCOMM frame starts with `0x5A`, then one type byte, a **big-endian 16-bit payload length**, and the payload. Control packets: type 2 = PTT start, type 3 = PTT end, type 7 = 4-byte big-endian sample rate. Type 1 carries signed 16-bit little-endian mono PCM; **type 6 carries IMA ADPCM** (the Windows and Android apps use type 6). Each connection's decoder, sample rate, queue and playback track are independent.

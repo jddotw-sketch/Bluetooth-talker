@@ -9,13 +9,20 @@ import java.util.concurrent.LinkedBlockingQueue
  */
 internal class OutgoingPacketQueue(
     capacity: Int = 30,
-    private val maxAudioPackets: Int = 15,
+    maxAudioPackets: Int = 15,
     private val isAudio: (Byte) -> Boolean
 ) {
     init {
         require(capacity > 0)
         require(maxAudioPackets in 1..capacity)
     }
+
+    @Volatile
+    var maxAudioPackets: Int = maxAudioPackets
+        set(value) {
+            require(value in 1..capacity)
+            field = value
+        }
 
     private val queue = LinkedBlockingQueue<Pair<Byte, ByteArray>>(capacity)
 

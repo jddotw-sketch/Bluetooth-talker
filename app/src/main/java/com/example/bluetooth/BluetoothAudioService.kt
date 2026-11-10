@@ -52,6 +52,7 @@ class BluetoothAudioService(
         const val TYPE_TEXT: Byte = 0x05
         const val TYPE_AUDIO_ADPCM: Byte = 0x06 // IMA-ADPCM 4:1 compressed ultra-low-latency audio
         const val TYPE_CONFIG: Byte = 0x07 // Transmits sample rate & audio config
+        const val TYPE_LATENCY_CONFIG: Byte = 0x08 // 1 byte: 0 = smooth, 1 = low latency
     }
 
     private val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
@@ -328,6 +329,12 @@ class BluetoothAudioService(
         synchronized(connections) { connections.values.toList() }
 
     private val encoderState = com.example.audio.AdpcmCodec.CodecState()
+    @Volatile
+    var lowLatencyEnabled: Boolean = false
+        set(value) {
+            field = value
+            activeWorkers().forEach { it.setLowLatency(value) }
+        }
 
     @Synchronized
     fun sendAudio(data: ByteArray) {
@@ -358,6 +365,10 @@ class BluetoothAudioService(
         activeWorkers().forEach { it.queuePacket(TYPE_TEXT, bytes) }
     }
 
+    fun sendLatencyConfig(enabled: Boolean = lowLatencyEnabled) {
+        activeWorkers().forEach { it.queuePacket(TYPE_LATENCY_CONFIG, byteArrayOf(if (enabled) 1 else 0)) }
+    }
+
     fun sendConfig(sampleRate: Int) {
         val bytes = ByteBuffer.allocate(4).putInt(sampleRate).array()
         activeWorkers().forEach { it.queuePacket(TYPE_CONFIG, bytes) }
@@ -372,6 +383,10 @@ class BluetoothAudioService(
         // Buffer capacity 30 packets (~600ms headroom to smoothly absorb RFCOMM jitter without dropping frames)
         private val sendQueue = OutgoingPacketQueue(30, 15) { it == TYPE_AUDIO || it == TYPE_AUDIO_ADPCM }
 
+        fun setLowLatency(enabled: Boolean) {
+            sendQueue.maxAudioPackets = if (enabled) 6 else 15
+        }
+
         private var readJob: Job? = null
         private var writeJob: Job? = null
         private var keepAliveJob: Job? = null
@@ -380,6 +395,7 @@ class BluetoothAudioService(
         private var lastSendTime = System.currentTimeMillis()
 
         fun start() {
+            setLowLatency(lowLatencyEnabled)
             // Dedicated Single-Threaded Write Loop
             writeJob = scope.launch {
                 try {

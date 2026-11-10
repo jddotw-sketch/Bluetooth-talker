@@ -31,11 +31,15 @@ class PeerAudioMixer {
     private val scope = CoroutineScope(Dispatchers.IO)
     private val peers = mutableMapOf<String, Peer>()
     private val rates = mutableMapOf<String, Int>()
+    private val lowLatency = mutableMapOf<String, Boolean>()
     private val mutex = Any()
     private val allowedRates = setOf(16000, 44100, 48000)
 
-    private class Peer(val address: String, val sampleRate: Int, private val scope: CoroutineScope) {
-        private val queue = LinkedBlockingQueue<ByteArray>(MAX_BUFFERED_PACKETS)
+    private class Peer(val address: String, val sampleRate: Int, private val scope: CoroutineScope,
+                       private val useLowLatency: Boolean, private val packetMs: Int) {
+        private val queue = LinkedBlockingQueue<ByteArray>(
+            AudioLatencyProfile.maxReceiveQueuePackets(useLowLatency, packetMs)
+        )
         private val track: AudioTrack
         private val writer: Job
 
@@ -58,7 +62,7 @@ class PeerAudioMixer {
                         .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                         .build()
                 )
-                .setBufferSizeInBytes(maxOf(minBytes * 3, sampleRate / 5 * 2))
+                .setBufferSizeInBytes(maxOf(minBytes, sampleRate * 2 * AudioLatencyProfile.initialTrackBufferMs(useLowLatency) / 1000))
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .build()
             require(track.state == AudioTrack.STATE_INITIALIZED) { "AudioTrack init failed" }
@@ -77,8 +81,8 @@ class PeerAudioMixer {
                         }
 
                         if (needInitialBuffer) {
-                            val deadline = SystemClock.elapsedRealtime() + STARTUP_BUFFER_WAIT_MS
-                            while (isActive && queue.size < STARTUP_BUFFER_PACKETS &&
+                            val deadline = SystemClock.elapsedRealtime() + AudioLatencyProfile.startupDeadlineMs(useLowLatency, packetMs)
+                            while (isActive && queue.size < AudioLatencyProfile.startupAdditionalPackets(useLowLatency) &&
                                 SystemClock.elapsedRealtime() < deadline) {
                                 delay(5)
                             }
@@ -126,6 +130,14 @@ class PeerAudioMixer {
         }
     }
 
+    fun setLowLatency(address: String, enabled: Boolean) {
+        synchronized(mutex) {
+            if (lowLatency[address] == enabled) return
+            lowLatency[address] = enabled
+            peers.remove(address)?.close()
+        }
+    }
+
     fun setSampleRate(address: String, rate: Int) {
         if (rate !in allowedRates) return
         synchronized(mutex) {
@@ -150,8 +162,15 @@ class PeerAudioMixer {
             }
 
             val rate = rates[address] ?: 16000
+            val frameMs = PcmFrameProfile.inferFrameMs(pcm.size) ?: 20
+            // New Android peers can transmit 10 ms frames; Windows and old Android
+            // peers still use the smooth 20 ms profile unless configured otherwise.
+            if (frameMs == 10 && lowLatency[address] != true) {
+                lowLatency[address] = true
+                peers.remove(address)?.close()
+            }
             val peer = peers[address] ?: try {
-                Peer(address, rate, scope).also { peers[address] = it }
+                Peer(address, rate, scope, lowLatency[address] == true, frameMs).also { peers[address] = it }
             } catch (e: Exception) {
                 Log.e(TAG, "Cannot create playback for $address at $rate Hz", e)
                 return
@@ -164,14 +183,16 @@ class PeerAudioMixer {
         synchronized(mutex) {
             peers.remove(address)?.close()
             rates.remove(address)
+            lowLatency.remove(address)
         }
     }
 
     fun retain(addresses: Set<String>) {
         synchronized(mutex) {
-            (peers.keys + rates.keys).filterNot { it in addresses }.forEach {
+            (peers.keys + rates.keys + lowLatency.keys).filterNot { it in addresses }.forEach {
                 peers.remove(it)?.close()
                 rates.remove(it)
+                lowLatency.remove(it)
             }
         }
     }
@@ -181,6 +202,7 @@ class PeerAudioMixer {
             peers.values.forEach { it.close() }
             peers.clear()
             rates.clear()
+            lowLatency.clear()
         }
         scope.cancel()
     }

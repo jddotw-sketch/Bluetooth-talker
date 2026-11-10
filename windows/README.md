@@ -20,7 +20,9 @@ The Android receiver accepts two simultaneous **RFCOMM/SPP** application streams
 
 **Windows COM port baud-rate compatibility:** BlueVoice configures the virtual SPP serial port at **115200 baud**, since some Windows Bluetooth COM drivers reject higher settings (for example 921600). RFCOMM is not a physical UART, so the serial driver's baud-rate setting is not necessarily the real over-the-air throughput. If audio stalls, select **16 kHz mono** first; high-quality 44.1 kHz needs more sustained Bluetooth bandwidth.
 
-The app captures your current default Windows output audio via WASAPI loopback (other apps remain audible on the PC). It converts this to 16 kHz mono by default, or 44.1 kHz mono for higher fidelity. It compresses each 20-ms frame with IMA ADPCM (roughly 4:1) before sending, to reduce SPP bandwidth and improve throughput. If streaming is choppy, select 16 kHz.
+The app captures your current default Windows output audio via WASAPI loopback (other apps remain audible on the PC). It converts this to 16 kHz mono by default, or 44.1 kHz mono for higher fidelity, and compresses the stream with IMA ADPCM (roughly 4:1).
+
+**Latency switch:** Windows now includes **Low latency (faster, less buffering)**, disabled by default. When enabled at 16 kHz, BlueVoice uses 10 ms ADPCM packets, a target 25 ms shared-mode WASAPI capture buffer, a 6-frame drop-oldest send queue, and the Android receiver's short-buffer mode (control type `0x08`). At 44.1 kHz, packets remain 20 ms to avoid an extra ADPCM padding sample, but the receiver and capture buffering are still shortened. Turn the switch off and reconnect if your Bluetooth link begins to stutter; this preserves the prior stable Windows configuration. Install the latest Android receiver first so it understands the low-latency control frame. The 115200 virtual COM-port setting is unchanged. The actual wireless and OS latency cannot be guaranteed.
 
 ## Limitations
 

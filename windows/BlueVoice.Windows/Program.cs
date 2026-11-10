@@ -20,6 +20,7 @@ internal sealed class MainWindow : Form
     private readonly ComboBox ports = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 130 };
     private readonly ComboBox qualities = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 180 };
     private readonly Button refresh = new() { Text = "Refresh ports", AutoSize = true };
+    private readonly CheckBox lowLatency = new() { Text = "Low latency (faster, less buffering)", AutoSize = true, Checked = false };
     private readonly Button start = new() { Text = "Connect + stream", AutoSize = true };
     private readonly Button stop = new() { Text = "Stop", AutoSize = true, Enabled = false };
     private readonly Label status = new() { Text = "Pair Android receiver in Windows Bluetooth settings, then select its outgoing COM port.", AutoSize = true, MaximumSize = new Size(480, 0) };
@@ -28,11 +29,11 @@ internal sealed class MainWindow : Form
     public MainWindow()
     {
         Text = "BlueVoice - Windows 11 audio sender";
-        ClientSize = new Size(540, 235);
-        MinimumSize = new Size(560, 280);
+        ClientSize = new Size(540, 265);
+        MinimumSize = new Size(560, 310);
         MaximizeBox = false;
         FormBorderStyle = FormBorderStyle.FixedSingle;
-        var root = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(16), ColumnCount = 1, RowCount = 5 };
+        var root = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(16), ColumnCount = 1, RowCount = 6 };
         root.Controls.Add(new Label { Text = "Stream all computer audio to your Android music receiver", AutoSize = true, Font = new Font(Font.FontFamily, 12, FontStyle.Bold) }, 0, 0);
 
         var row1 = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Top };
@@ -47,12 +48,13 @@ internal sealed class MainWindow : Form
         row2.Controls.Add(start);
         row2.Controls.Add(stop);
         root.Controls.Add(row2, 0, 2);
-        root.Controls.Add(status, 0, 3);
+        root.Controls.Add(lowLatency, 0, 3);
+        root.Controls.Add(status, 0, 4);
         root.Controls.Add(new Label {
             Text = "Requires a Bluetooth SPP serial connection to BlueVoice on Android. This is not standard A2DP pairing.",
             AutoSize = true, MaximumSize = new Size(490, 0),
             ForeColor = Color.DimGray
-        }, 0, 4);
+        }, 0, 5);
         Controls.Add(root);
         qualities.Items.Add("16 kHz mono - stable voice");
         qualities.Items.Add("44.1 kHz mono - higher quality");
@@ -82,7 +84,7 @@ internal sealed class MainWindow : Form
         }
         try {
             var rate = qualities.SelectedIndex == 1 ? 44100 : 16000;
-            sender = new LoopbackSender(port, rate);
+            sender = new LoopbackSender(port, rate, lowLatency.Checked);
             sender.Stopped += error => {
                 if (IsHandleCreated) BeginInvoke((Action)(() => {
                     status.Text = error is null ? "Audio capture stopped." : $"Stream stopped: {error.Message}";
@@ -90,9 +92,11 @@ internal sealed class MainWindow : Form
                 }));
             };
             sender.Start();
-            status.Text = $"Streaming ADPCM audio to Android on {port} at {rate} Hz. " +
-                (rate == 44100 ? "If audio stutters, select 16 kHz." : "Stable low-bandwidth mode.");
-            start.Enabled = false; stop.Enabled = true; ports.Enabled = false; qualities.Enabled = false;
+            int packetMs = WindowsLatencyProfile.PacketMilliseconds(rate, lowLatency.Checked);
+            status.Text = $"Streaming ADPCM on {port} at {rate} Hz / {packetMs} ms frames (" +
+                (lowLatency.Checked ? "Low latency" : "Smooth") + "). " +
+                (rate == 44100 && lowLatency.Checked ? "44.1 kHz uses 20 ms packets for compatibility." : "");
+            start.Enabled = false; stop.Enabled = true; ports.Enabled = false; qualities.Enabled = false; lowLatency.Enabled = false;
         } catch (Exception ex) {
             sender?.Dispose(); sender = null;
             status.Text = ex is UnauthorizedAccessException
@@ -107,16 +111,17 @@ internal sealed class MainWindow : Form
     {
         sender?.Dispose();
         sender = null;
-        start.Enabled = true; stop.Enabled = false; ports.Enabled = true; qualities.Enabled = true;
+        start.Enabled = true; stop.Enabled = false; ports.Enabled = true; qualities.Enabled = true; lowLatency.Enabled = true;
     }
 }
 
 internal sealed class LoopbackSender : IDisposable
 {
-    private const byte Magic = 0x5A, AudioAdpcm = 0x06, StartPtt = 0x02, EndPtt = 0x03, Config = 0x07;
+    private const byte Magic = 0x5A, AudioAdpcm = 0x06, StartPtt = 0x02, EndPtt = 0x03, Config = 0x07, LatencyConfig = 0x08;
     private readonly SerialPort serial;
     private readonly AdpcmEncoder encoder = new();
-    private readonly WasapiLoopbackCapture capture;
+    private readonly ConfigurableLoopbackCapture capture;
+    private readonly bool lowLatencyMode;
     private readonly Channel<byte[]> frames;
     private readonly CancellationTokenSource cancel = new();
     private readonly int targetRate;
@@ -129,9 +134,10 @@ internal sealed class LoopbackSender : IDisposable
     private bool disposed;
     public event Action<Exception?>? Stopped;
 
-    public LoopbackSender(string port, int sampleRate)
+    public LoopbackSender(string port, int sampleRate, bool lowLatency)
     {
         targetRate = sampleRate;
+        lowLatencyMode = lowLatency;
         // Windows Bluetooth virtual COM drivers commonly cap the configurable baud rate
         // at 115200 even though RFCOMM data travels over Bluetooth rather than a UART.
         // Do not request 921600: SerialPort.Open rejects it on those drivers.
@@ -140,8 +146,8 @@ internal sealed class LoopbackSender : IDisposable
             ReadTimeout = 1500,
             WriteTimeout = 1500
         };
-        capture = new WasapiLoopbackCapture();
-        frames = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(20) {
+        capture = new ConfigurableLoopbackCapture(lowLatencyMode);
+        frames = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(WindowsLatencyProfile.QueueFrames(lowLatencyMode)) {
             FullMode = BoundedChannelFullMode.DropOldest,
             SingleReader = true,
             SingleWriter = true
@@ -158,6 +164,9 @@ internal sealed class LoopbackSender : IDisposable
         WritePacket(Config, BitConverter.IsLittleEndian
             ? new byte[] { (byte)(targetRate >> 24), (byte)(targetRate >> 16), (byte)(targetRate >> 8), (byte)targetRate }
             : BitConverter.GetBytes(targetRate));
+        // This control packet is backwards compatible; updated Android receivers
+        // shorten their own jitter/output buffers when enabled.
+        WritePacket(LatencyConfig, new byte[] { lowLatencyMode ? (byte)1 : (byte)0 });
         WritePacket(StartPtt, Array.Empty<byte>());
         writer = Task.Run(async () => {
             try {
@@ -216,7 +225,7 @@ internal sealed class LoopbackSender : IDisposable
                         int signed = (int)Math.Round(Math.Clamp(sample, -1f, 1f) * 32767f);
                         pcm.Add((byte)signed);
                         pcm.Add((byte)(signed >> 8));
-                        int packetBytes = targetRate * 2 / 50; // 20 ms
+                        int packetBytes = WindowsLatencyProfile.PacketBytes(targetRate, lowLatencyMode);
                         if (pcm.Count >= packetBytes) {
                             frames.Writer.TryWrite(pcm.GetRange(0, packetBytes).ToArray());
                             pcm.RemoveRange(0, packetBytes);
